@@ -23,6 +23,26 @@ def tiny_config(**kwargs):
         conv_kernel=3, scan_backend="reference"), **kwargs))
 
 
+def test_old_checkpoint_config_retains_legacy_mixer_and_parameter_layout():
+    settings = tiny_config().to_dict()
+    settings.pop("mixer_impl")
+    restored = Enhancer(ModelConfig.from_dict(settings))
+    assert restored.config.mixer_impl == "legacy"
+    assert isinstance(restored.blocks[0].temporal, SelectiveMixer)
+    assert "blocks.0.temporal.in_projection.weight" in restored.state_dict()
+    restored.load_state_dict(Enhancer(tiny_config()).state_dict(), strict=True)
+
+
+@pytest.mark.parametrize("values", [
+    {"mixer_impl": "unknown"},
+    {"mixer_impl": "mamba_ssm", "scan_backend": "reference"},
+    {"mixer_impl": "mamba_ssm", "scan_backend": "mamba_ssm"},
+])
+def test_mixer_selection_does_not_silently_change_architecture(values):
+    with pytest.raises(ValueError):
+        tiny_config(**values)
+
+
 @pytest.mark.parametrize("kernel", [1, 4])
 def test_selective_scan_matches_steps_and_has_finite_gradients(kernel):
     layer = SelectiveMixer(4, 3, 2, kernel, "reference")

@@ -201,7 +201,7 @@ def test_hydra_internal_ddp_and_external_torchrun_gan_entrypoints(tmp_path):
     train, validation = write_manifests(tmp_path / "data")
     common = ["experiment=fixed4", "model.sample_rate=800", "model.depth=1", "model.exits=[1]",
               "model.width=4", "model.state_dim=2", "model.expand=1", "model.conv_kernel=2",
-              "model.scan_backend=reference", "training.steps=1", "training.batch_size=1",
+              "model.scan_backend=reference", "model.mixer_impl=legacy", "training.steps=1", "training.batch_size=1",
               "training.crop_seconds=0.16", "training.grad_accum=2", "training.workers=0",
               "training.checkpoint_every=1", "training.validate_every=1", "training.validation_batches=20",
               "training.log_every=1", "loss.fft_sizes=[16,32]", "loss.stft=0.1",

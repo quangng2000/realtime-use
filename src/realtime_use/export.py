@@ -28,17 +28,13 @@ def extract_exit(source: Enhancer, exit_depth: int) -> Enhancer:
             source_key = f"decoders.{exit_depth}." + key.removeprefix("shared_decoder.")
         selected_state[key] = source_state[source_key].detach().cpu().clone()
     exported.load_state_dict(selected_state, strict=True)
-    return exported.eval()
+    return exported.to(next(source.parameters()).device).eval()
 
 
 @torch.inference_mode()
 def verify_export(source: Enhancer, exported: Enhancer, exit_depth: int) -> dict[str, float]:
-    """Compare full and chunked outputs with the portable CPU reference backend."""
-    source_settings = source.config.to_dict()
-    source_settings["scan_backend"] = "reference"
-    reference = Enhancer(ModelConfig.from_dict(source_settings))
-    reference.load_state_dict(source.state_dict(), strict=True)
-    reference.eval()
+    """Compare full and chunked outputs on the selected architecture and device."""
+    reference = source.eval()
     hop = round(source.config.sample_rate * source.config.hop_ms / 1000)
     generator = torch.Generator().manual_seed(2026)
     # Includes a partial final hop and non-hop-aligned input chunks.
@@ -65,20 +61,22 @@ def verify_export(source: Enhancer, exported: Enhancer, exit_depth: int) -> dict
         torch.set_num_threads(previous_threads)
 
 
-def export_exit(checkpoint: str | Path, exit_depth: int, output: str | Path) -> Path:
+def export_exit(checkpoint: str | Path, exit_depth: int, output: str | Path,
+                device: str | torch.device = "cpu") -> Path:
     destination = Path(output)
     if destination.exists():
         raise FileExistsError(f"Refusing to overwrite {destination}")
     if destination.resolve() == Path(checkpoint).resolve():
         raise ValueError("Export destination must differ from the source checkpoint")
-    source = load_model(checkpoint, device="cpu")
+    source = load_model(checkpoint, device=device)
     exported = extract_exit(source, exit_depth)
     verification = verify_export(source, exported, exit_depth)
     payload = {
         "format_version": 1, "model_config": exported.config.to_dict(),
-        "model_state": exported.state_dict(), "stage": "export",
+        "model_state": {key: value.detach().cpu() for key, value in exported.state_dict().items()}, "stage": "export",
         "exit_depth": exit_depth, "active_parameters": exported.active_parameter_count(exit_depth),
-        "verification": {"backend": "CPU reference", **verification},
+        "verification": {"backend": source.config.mixer_impl,
+                         "device": str(next(source.parameters()).device), **verification},
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation prevents a concurrently created destination being replaced.
@@ -98,10 +96,12 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--exit-depth", type=int, required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--device", default="cpu", help="Official Mamba checkpoints require cuda")
     args = parser.parse_args()
-    result = export_exit(args.checkpoint, args.exit_depth, args.output)
+    result = export_exit(args.checkpoint, args.exit_depth, args.output, device=args.device)
     print(json.dumps({"event": "exported", "checkpoint": str(result),
-                      "exit_depth": args.exit_depth, "verification": "CPU full/stream equivalence"}))
+                      "exit_depth": args.exit_depth, "verification": "full/stream equivalence",
+                      "device": args.device}))
 
 
 if __name__ == "__main__":

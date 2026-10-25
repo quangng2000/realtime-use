@@ -10,7 +10,7 @@ Pass manifests through Hydra when training:
 python -m realtime_use.train experiment=fixed4 \
   data.train_manifest=/absolute/path/to/train.jsonl \
   data.validation_manifest=/absolute/path/to/validation.jsonl \
-  trainer.accelerator=cpu trainer.devices=1
+  trainer.accelerator=gpu trainer.devices=1
 ```
 
 These paths select user-provided files; they do not trigger downloads. Absolute manifest paths avoid ambiguity when running sweeps. Audio paths within each manifest are still resolved relative to that manifest.
@@ -43,7 +43,22 @@ Teacher audio must have the same rate, channels, length, and alignment. Providin
 
 For simulated reverberation, the referenced offline paper motivates an anechoic target shifted to align with the direct path of the simulated room response. Prepare and inspect that alignment during dataset construction. The loader's length check cannot establish perceptual or physical alignment.
 
-The initial paired-data loader is not a complete reproduction of the URGENT corruption generator. If adding noise, reverberation, clipping, band limitation, codecs, packet loss, or wind noise, document each process and its parameters. Apply the process only to splits and materials for which you have the relevant permissions.
+The paired-data loader offers optional training-only corruptions through [audiomentations](https://github.com/iver56/audiomentations): Gaussian noise with sampled SNR, clipping, and low-pass filtering. Install and enable them with:
+
+```bash
+python -m pip install -e '.[augmentation]'
+python -m realtime_use.train experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  data.augmentation.enabled=true \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+Transform probabilities and ranges are recorded under `data.augmentation` in the resolved configuration. Corruption changes only the noisy training input, preserves sample count, and leaves clean targets and validation audio unchanged. Gaussian SNR is relative to the supplied input waveform. This can further degrade already-noisy input; it is not a calibrated clean-speech/noise-corpus mixer. Python/NumPy worker randomness follows Lightning's worker seeding; exact mid-epoch replay is not promised.
+
+Enabled augmentation is incompatible with cached-output distillation. Cached teacher outputs describe a specific input; additional random corruption would invalidate that correspondence. The loader rejects this combination instead of applying unrelated transforms to teacher and clean audio.
+
+These three library transforms are not a reproduction of the full URGENT corruption generator. RIR synthesis and direct-path target shifts, codecs, packet loss, wind-noise simulation, and curated corpus mixing remain unimplemented. Do not use an arbitrary library reverb transform without defining target delay and tail handling.
 
 Clean targets need listening and signal checks. Residual noise in a target can teach the model to preserve it. Keep clean speech examples in the validation plan to detect unnecessary distortion.
 

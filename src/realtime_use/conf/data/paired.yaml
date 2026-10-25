@@ -2,3 +2,20 @@ train_manifest: null
 validation_manifest: null
 pin_memory: false
 smoke: false
+augmentation:
+  enabled: false
+  gaussian_snr:
+    p: 0.3
+    min_snr_db: 5.0
+    max_snr_db: 30.0
+  clipping:
+    p: 0.2
+    min_percentile_threshold: 0
+    max_percentile_threshold: 10
+  low_pass:
+    p: 0.2
+    min_cutoff_freq: 1000.0
+    max_cutoff_freq: 6000.0
+    min_rolloff: 12
+    max_rolloff: 24
+    zero_phase: true

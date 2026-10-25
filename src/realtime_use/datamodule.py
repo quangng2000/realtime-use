@@ -17,6 +17,7 @@ from typing import Any
 from lightning import LightningDataModule
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
+from .augmentation import augmentation_enabled
 from .config import ModelConfig
 from .data import PairedAudioDataset, SyntheticDataset, collate_audio
 from .distributed_data import PaddedValidationSampler, ValidationDataset
@@ -59,10 +60,14 @@ class PairedAudioDataModule(LightningDataModule):
         self.load_teacher = stage == "regression" and kd_weight > 0
         self.smoke = data.get("smoke", False)
         self.pin_memory = data.get("pin_memory", False)
+        self.augmentation = data.get("augmentation")
+        augmentation_enabled(self.augmentation)
         if not isinstance(self.smoke, bool) or not isinstance(self.pin_memory, bool):
             raise ValueError("data.smoke and data.pin_memory must be booleans")
         if self.smoke and self.load_teacher:
             raise ValueError("Synthetic smoke data has no teacher targets; set loss.kd=0")
+        if self.smoke and augmentation_enabled(self.augmentation):
+            raise ValueError("Input augmentation requires real paired data; disable data.smoke")
         self.train_manifest = data.get("train_manifest")
         self.validation_manifest = data.get("validation_manifest")
         self.train_dataset: Dataset | None = None
@@ -87,6 +92,7 @@ class PairedAudioDataModule(LightningDataModule):
                     crop_samples=self.crop_samples,
                     training=True,
                     load_teacher=self.load_teacher,
+                    augmentation=self.augmentation,
                 )
                 if self.load_teacher and any("teacher" not in row for row in dataset.records):
                     raise ValueError("Regression loss.kd > 0 requires a teacher target on every training row")

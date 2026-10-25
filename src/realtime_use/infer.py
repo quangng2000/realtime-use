@@ -18,9 +18,8 @@ from .model import Enhancer
 def load_model(checkpoint: str | Path, device: str | torch.device = "cpu") -> Enhancer:
     """Load tensor/builtin-only checkpoints, with strict architecture matching.
 
-    Scan backends share parameter layouts. Non-CUDA inference selects the
-    portable reference scan, including checkpoints trained with an explicitly
-    requested CUDA kernel; the checkpoint file itself remains unchanged.
+    Legacy scan backends share parameter layouts and support CPU inference.
+    Official Mamba checkpoints keep their architecture and require CUDA.
     """
     device = torch.device(device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -30,6 +29,9 @@ def load_model(checkpoint: str | Path, device: str | torch.device = "cpu") -> En
         raise ValueError("checkpoint must contain model_config and model_state")
     model_config = dict(payload["model_config"])
     if device.type != "cuda":
+        if model_config.get("mixer_impl", "legacy") == "mamba_ssm":
+            raise RuntimeError("Official Mamba checkpoints require CUDA (--device cuda); "
+                               "CPU/phone deployment is not implemented for this architecture")
         model_config["scan_backend"] = "reference"
     model = Enhancer(ModelConfig.from_dict(model_config))
     model.load_state_dict(payload["model_state"], strict=True)

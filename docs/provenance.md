@@ -14,6 +14,7 @@ This ledger separates research references, project code, dependencies, training 
 
 1. [One Model, Many Latencies: Universal Speech Enhancement for Diverse Real-Time Applications](https://arxiv.org/abs/2606.25621). Method reference for causal enhancement, controllable depth/look-ahead, shared-to-per-exit decoder training, and regression followed by adversarial training. No paper figures, model code, or weights are redistributed here.
 2. [Rethinking Training Targets, Architectures and Data Quality for Universal Speech Enhancement](https://arxiv.org/abs/2603.02641). Method reference for target alignment, data curation, and the distinct frozen-regression/residual-generator design. That offline two-network architecture is not the current project architecture.
+3. [Universal Speech Enhancement with Regression and Generative Mamba](https://arxiv.org/abs/2505.21198). USEMamba architecture lineage. Its flow-matching variant is not implemented here.
 
 The [original RE-USE card](https://huggingface.co/nvidia/RE-USE) identifies its release as research/development-only under NVIDIA's noncommercial license. The [NemotronLabs RE-USE card](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE) identifies a separate release under OpenMDW-1.1. Neither has been selected as a training material. Do not infer identical permissions from similar names, shared authors, or related papers.
 
@@ -21,7 +22,9 @@ The [original RE-USE card](https://huggingface.co/nvidia/RE-USE) identifies its 
 
 Runtime and test dependencies are declared in `pyproject.toml`. They are installed separately rather than vendored. Before distributing software or model artifacts, record the exact resolved versions and review the applicable package licenses and notices, including transitive dependencies and any subsequently added acceleration kernels.
 
-Changing from the reference scan to third-party optimized code is a new dependency decision. Record its source revision and terms before incorporation.
+New reconstruction presets use [auraloss 0.4.0](https://github.com/csteinmetz1/auraloss/tree/v0.4.0), under [Apache-2.0](https://github.com/csteinmetz1/auraloss/blob/v0.4.0/LICENSE). Optional input augmentation uses [audiomentations 0.43.1](https://github.com/iver56/audiomentations/tree/v0.43.1), under [MIT](https://github.com/iver56/audiomentations/blob/v0.43.1/LICENSE). Neither integration downloads audio or pretrained model weights. Evaluation records installed PyTorch/TorchMetrics versions because library metric numerics are part of the reported result.
+
+The optional CUDA dependencies are the official [state-spaces/mamba v2.2.6.post3](https://github.com/state-spaces/mamba/tree/v2.2.6.post3), under [Apache-2.0](https://github.com/state-spaces/mamba/blob/v2.2.6.post3/LICENSE), and [causal-conv1d v1.6.0](https://github.com/Dao-AILab/causal-conv1d/tree/v1.6.0), under [BSD-3-Clause](https://github.com/Dao-AILab/causal-conv1d/blob/v1.6.0/LICENSE). The project imports these packages; it does not vendor their implementations or use pretrained language-model weights. The new Mamba adapter delegates to the complete upstream Mamba-1 class. This dependency is distinct from NVIDIA's restricted enhancement wrapper and model weights.
 
 ## Required record for every future dataset
 

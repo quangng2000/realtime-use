@@ -38,6 +38,7 @@ def test_hydra_experiment_composition(tmp_path, experiment, depth, exits):
     cfg = config_for(tmp_path, experiment)
     assert cfg.model.depth == depth
     assert list(cfg.model.exits) == exits
+    assert cfg.model.mixer_impl == "mamba_ssm"
     assert cfg.training.split_decoders_at == (50000 if experiment == "flexible12" else None)
 
 
@@ -45,7 +46,7 @@ def tiny_paired_config(tmp_path):
     tmp_path.mkdir(exist_ok=True)
     cfg = config_for(tmp_path / "regression", "flexible12")
     cfg.model.update(sample_rate=800, depth=2, exits=[1,2], width=4, state_dim=2,
-                     expand=1, conv_kernel=2, scan_backend="reference")
+                     expand=1, conv_kernel=2, scan_backend="reference", mixer_impl="legacy")
     cfg.training.update(steps=2, batch_size=2, crop_seconds=0.16, workers=0,
         grad_accum=2, checkpoint_every=1, validate_every=1, validation_batches=1,
         log_every=1, split_decoders_at=1)
@@ -110,6 +111,21 @@ def test_native_kd_split_gan_resume_and_inference_export(tmp_path):
     bad.training.stage="regression"
     with pytest.raises(ValueError,match="preserve stage"):
         run_training(bad)
+
+
+def test_official_run_rejects_legacy_weights_before_creating_output(tmp_path):
+    cfg, _ = tiny_paired_config(tmp_path)
+    old_model_config = OmegaConf.to_container(cfg.model, resolve=True)
+    old_model_config.pop("mixer_impl")
+    source = tmp_path / "legacy.pt"
+    torch.save({"model_config": old_model_config, "model_state": {},
+                "stage": "regression", "step": 0}, source)
+    cfg.model.mixer_impl = "mamba_ssm"
+    cfg.model.scan_backend = "auto"
+    cfg.init_from = str(source)
+    with pytest.raises(ValueError, match="architecture differs at mixer_impl"):
+        run_training(cfg)
+    assert not Path(cfg.output_dir).exists()
 
 
 def test_legacy_weights_initialize_but_cannot_native_resume(tmp_path):

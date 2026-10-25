@@ -10,3 +10,4 @@ expand: 4
 conv_kernel: 4
 decoder_mode: shared
 scan_backend: auto
+mixer_impl: mamba_ssm

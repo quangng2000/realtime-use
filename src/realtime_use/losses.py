@@ -60,16 +60,59 @@ class MultiResolutionSTFTLoss(nn.Module):
 
 
 class ReconstructionLoss(nn.Module):
-    """Clean-reference or output-distillation waveform and spectral objective."""
+    """Length-aware waveform/STFT objective, with explicit library selection.
+
+    ``legacy`` preserves the original objective for existing checkpoints.
+    ``auraloss`` delegates spectral losses to the maintained library; its
+    centered STFT and magnitude floor differ from the legacy calculation.
+    Neither choice establishes reproduction of the paper's exact objective.
+    """
 
     def __init__(self, waveform: float = 1.0, stft: float = 1.0,
-                 fft_sizes: Sequence[int] = (256, 512, 1024)) -> None:
+                 fft_sizes: Sequence[int] = (256, 512, 1024),
+                 implementation: str = "legacy") -> None:
         super().__init__()
         if (not math.isfinite(waveform) or not math.isfinite(stft)
                 or waveform < 0 or stft < 0 or waveform + stft <= 0):
             raise ValueError("Reconstruction weights must be nonnegative and nonzero")
+        if implementation not in {"legacy", "auraloss"}:
+            raise ValueError("loss.implementation must be legacy or auraloss")
+        self.implementation = implementation
         self.waveform_weight, self.stft_weight = float(waveform), float(stft)
-        self.spectral = MultiResolutionSTFTLoss(fft_sizes)
+        self.waveform = nn.L1Loss(reduction="mean")
+        if implementation == "legacy":
+            self.spectral = MultiResolutionSTFTLoss(fft_sizes)
+        else:
+            from auraloss.freq import MultiResolutionSTFTLoss as AuralossSTFTLoss
+
+            sizes = tuple(int(size) for size in fft_sizes)
+            if not sizes or any(size < 8 for size in sizes):
+                raise ValueError("fft_sizes must contain integers >= 8")
+            self.spectral = AuralossSTFTLoss(
+                fft_sizes=list(sizes), hop_sizes=[size // 4 for size in sizes],
+                win_lengths=list(sizes), window="hann_window", w_sc=1.0,
+                w_log_mag=1.0, w_lin_mag=0.0, w_phs=0.0, sample_rate=None,
+                scale=None, n_bins=None, perceptual_weighting=False,
+                scale_invariance=False, eps=1e-8, output="loss",
+                reduction="mean", mag_distance="L1")
+            # auraloss uses torch.stft's centered reflection padding. A short
+            # valid crop needs this much audio before that padding is legal.
+            self.minimum_spectral_length = max(sizes) // 2 + 1
+
+    def _spectral_loss(self, estimate: Tensor, target: Tensor) -> Tensor:
+        if self.implementation == "legacy":
+            return self.spectral(estimate, target)
+        with torch.autocast(device_type=estimate.device.type, enabled=False):
+            padding = max(0, self.minimum_spectral_length - estimate.shape[-1])
+            estimate = F.pad(estimate.float(), (0, padding))
+            target = F.pad(target.float(), (0, padding))
+            # Library spectral convergence reduces across its whole batch.
+            # Singleton calls keep utterances equally weighted, including when
+            # length grouping or DDP changes which examples share a batch.
+            return torch.stack([
+                self.spectral(predicted[None, None], reference[None, None])
+                for predicted, reference in zip(estimate, target)
+            ]).mean()
 
     def forward(self, estimate: Tensor, target: Tensor,
                 lengths: Tensor | None = None) -> tuple[Tensor, dict[str, Tensor]]:
@@ -81,9 +124,9 @@ class ReconstructionLoss(nn.Module):
             predicted = estimate[indices, :length]
             reference = target[indices, :length]
             weight = len(indices) / len(estimate)
-            waveform = waveform + weight * F.l1_loss(predicted.float(), reference.float())
+            waveform = waveform + weight * self.waveform(predicted.float(), reference.float())
             if self.stft_weight:
-                spectral = spectral + weight * self.spectral(predicted, reference)
+                spectral = spectral + weight * self._spectral_loss(predicted, reference)
         total = self.waveform_weight * waveform + self.stft_weight * spectral
         return total, {"waveform_l1": waveform.detach(), "stft_loss": spectral.detach()}
 

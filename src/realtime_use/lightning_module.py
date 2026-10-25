@@ -13,10 +13,12 @@ from typing import Any
 
 from lightning.pytorch import LightningModule
 from lightning.pytorch.strategies import DDPStrategy
+import numpy as np
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch import distributed as dist
 from torch.nn.parallel import DistributedDataParallel
+from torchmetrics.aggregation import MeanMetric
 
 from .config import ModelConfig
 from .discriminators import MultiScaleDiscriminator
@@ -82,7 +84,8 @@ class EnhancementModule(LightningModule):
         self._set_active_head_gradients()
         self.criterion = ReconstructionLoss(float(self.loss_config.get("waveform", 1)),
                                             float(self.loss_config.get("stft", 1)),
-                                            self.loss_config.get("fft_sizes", (256, 512, 1024)))
+                                            self.loss_config.get("fft_sizes", (256, 512, 1024)),
+                                            implementation=self.loss_config.get("implementation", "legacy"))
         self.discriminator = (MultiScaleDiscriminator(int(self.adversarial_config.get("channels", 16)),
                                                       int(self.adversarial_config.get("scales", 3)))
                               if self.stage == "adversarial" else None)
@@ -90,8 +93,10 @@ class EnhancementModule(LightningModule):
         self.microbatches_in_update = 0
         self._update_metrics: dict[str, Tensor] = {}
         self._generator_optimizer: torch.optim.Optimizer | None = None
-        self._validation_totals: dict[str, Tensor] = {}
-        self._validation_examples = 0
+        self.validation_metrics = nn.ModuleDict({
+            str(depth): MeanMetric(nan_strategy="error").set_dtype(torch.float64)
+            for depth in self.model.config.exits
+        })
         self.last_exit_depths: tuple[int, ...] = ()
 
     def _set_active_head_gradients(self) -> None:
@@ -105,15 +110,28 @@ class EnhancementModule(LightningModule):
         return self.model.enhance(waveform, exit_depths=exit_depths)
 
     def configure_optimizers(self):
-        backbone, heads = [], []
+        backbone, heads, backbone_no_decay, heads_no_decay = [], [], [], []
         for name, parameter in self.model.named_parameters():
-            (heads if "decoder" in name else backbone).append(parameter)
+            if getattr(parameter, "_no_weight_decay", False):
+                (heads_no_decay if "decoder" in name else backbone_no_decay).append(parameter)
+            else:
+                (heads if "decoder" in name else backbone).append(parameter)
         backbone_lr = self.base_lr * (self.backbone_lr_scale
                                       if self.model.config.decoder_mode == "per_exit" else 1.0)
-        generator = torch.optim.AdamW([
+        groups = [
             {"params": backbone, "lr": backbone_lr, "name": "backbone"},
             {"params": heads, "lr": self.base_lr, "name": "decoders"},
-        ], lr=self.base_lr, weight_decay=self.weight_decay)
+        ]
+        # Upstream Mamba exempts its state dynamics and skip parameters from
+        # weight decay. Leave unflagged legacy models' two groups unchanged so
+        # their existing native optimizer checkpoints remain compatible.
+        for parameters, learning_rate, name in (
+                (backbone_no_decay, backbone_lr, "backbone"),
+                (heads_no_decay, self.base_lr, "decoders")):
+            if parameters:
+                groups.append({"params": parameters, "lr": learning_rate,
+                               "name": name, "weight_decay": 0.0})
+        generator = torch.optim.AdamW(groups, lr=self.base_lr, weight_decay=self.weight_decay)
         self._generator_optimizer = generator
         if self.discriminator is None:
             return generator
@@ -260,10 +278,8 @@ class EnhancementModule(LightningModule):
     def on_validation_epoch_start(self) -> None:
         if self.microbatches_in_update:
             raise RuntimeError("Validate only between optimizer updates; align validation interval with grad_accum")
-        self._validation_totals = {f"validation_clean_loss_exit_{depth}":
-                                   torch.zeros((), dtype=torch.float64, device=self.device)
-                                   for depth in self.model.config.exits}
-        self._validation_examples = 0
+        for metric in self.validation_metrics.values():
+            metric.reset()
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:
         # Equal-sized padded batches execute on every rank. Padding duplicates
@@ -283,21 +299,21 @@ class EnhancementModule(LightningModule):
                 loss, _ = self.criterion(prediction[valid], batch["clean"][valid], lengths=lengths)
             # All ranks call the finite check even when this rank has zero originals.
             _finite(loss, "validation loss")
-            key = f"validation_clean_loss_exit_{depth}"
-            self._validation_totals[key] += loss.detach().double() * count
-        self._validation_examples += count
+            self.validation_metrics[str(depth)].update(loss.detach(), weight=count)
 
     def on_validation_epoch_end(self) -> None:
-        names = list(self._validation_totals)
-        values = torch.stack([torch.tensor(self._validation_examples, dtype=torch.float64, device=self.device),
-                              *[self._validation_totals[name] for name in names]])
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(values, op=dist.ReduceOp.SUM)
-        if not bool(values[0]):
+        # MeanMetric synchronizes its weighted sum and weight on every rank,
+        # including ranks that only saw zero-weight validation duplicates.
+        metrics = {f"validation_clean_loss_exit_{depth}": metric.compute()
+                   for depth, metric in self.validation_metrics.items()}
+        values = torch.stack(list(metrics.values()))
+        if bool(torch.isnan(values).all()):
+            # All updates were finite with nonnegative weights, so 0/0 means
+            # the global validation input contained no original utterances.
             return
-        metrics = {name: values[index + 1] / values[0] for index, name in enumerate(names)}
-        metrics["validation_mean_clean_loss"] = torch.stack(list(metrics.values())).mean()
-        # Values are already global sum/count means, including unequal valid counts.
+        _finite(values, "aggregated validation loss")
+        metrics["validation_mean_clean_loss"] = values.mean()
+        # The computed TorchMetrics values are already synchronized globally.
         self.log_dict(metrics, on_step=False, on_epoch=True, logger=self.logger is not None, sync_dist=False)
 
     def _portable_model_state(self) -> dict[str, Tensor]:
@@ -329,25 +345,31 @@ class EnhancementModule(LightningModule):
         self._set_active_head_gradients()
 
     def _rng_device(self) -> torch.device:
-        # Lightning restores before moving the module to its device and invokes
-        # on_fit_end after moving it back to CPU. The strategy retains the rank's
-        # assigned accelerator throughout both lifecycle points.
+        # Lightning restores before moving the module to its device. The
+        # strategy already knows the rank's assigned accelerator at that point.
         return self.trainer.strategy.root_device if self._trainer is not None else self.device
 
     def capture_rng_state(self) -> dict[str, Any]:
-        """Capture this rank's Python and PyTorch RNGs without a collective."""
+        """Capture this rank's Python, NumPy and PyTorch RNGs without a collective."""
         state = {"python_rng_state": random.getstate(), "torch_rng_state": torch.get_rng_state()}
+        numpy_state = np.random.get_state()
+        # Builtins keep weights_only checkpoint loading safe. NumPy ndarray
+        # pickles would otherwise require additional deserialization globals.
+        state["numpy_rng_state"] = (numpy_state[0], numpy_state[1].tolist(), *numpy_state[2:])
         rng_device = self._rng_device()
         if rng_device.type == "cuda":
             state["cuda_rng_state"] = torch.cuda.get_rng_state(rng_device)
         return state
 
     def restore_rng_state(self, state: dict[str, Any]) -> None:
-        """Restore local RNGs, including around a separate Trainer.validate call."""
+        """Restore this rank's RNGs; older checkpoints may omit NumPy state."""
         if "python_rng_state" in state:
             random.setstate(state["python_rng_state"])
         if "torch_rng_state" in state:
             torch.set_rng_state(state["torch_rng_state"].cpu())
+        if "numpy_rng_state" in state:
+            numpy_state = state["numpy_rng_state"]
+            np.random.set_state((numpy_state[0], np.asarray(numpy_state[1], dtype=np.uint32), *numpy_state[2:]))
         rng_device = self._rng_device()
         if rng_device.type == "cuda" and "cuda_rng_state" in state:
             torch.cuda.set_rng_state(state["cuda_rng_state"].cpu(), rng_device)

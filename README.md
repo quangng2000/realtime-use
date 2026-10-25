@@ -1,10 +1,10 @@
 # realtime-use
 
-An independent PyTorch research implementation for small, causal speech enhancement models with **4, 8, or 12 time–frequency blocks**, trained with **PyTorch Lightning and Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
+An independent PyTorch research implementation for small, causal speech enhancement models with **4, 8, or 12 time–frequency blocks**, using **official `mamba_ssm.Mamba` blocks**, **PyTorch Lightning**, and **Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
 
 The project uses the methods in [One Model, Many Latencies](https://arxiv.org/abs/2606.25621) and [Rethinking Training Targets, Architectures and Data Quality](https://arxiv.org/abs/2603.02641) as research references. It does not download or include NVIDIA checkpoints or restricted model source code. Models start from random initialization unless you explicitly supply your own compatible checkpoint.
 
-**Status:** a training and streaming baseline for experiments. It is not an exact reproduction of either paper, a pretrained enhancement product, or evidence of published quality or latency. The complete URGENT degradation pipeline, sample-rate-independent training, and adjustable look-ahead remain future work. The initial Python reference scan prioritizes correctness; deployment speed must be measured on the intended hardware.
+**Status:** a training and streaming baseline for experiments. It is not an exact reproduction of either paper, a pretrained enhancement product, or evidence of published quality or latency. The complete URGENT degradation pipeline, sample-rate-independent training, and adjustable look-ahead remain future work. The official Mamba path requires CUDA; the earlier independent mixer remains an explicitly selected legacy CPU baseline. Deployment speed must be measured on the intended hardware.
 
 ## Set up
 
@@ -27,13 +27,15 @@ python -m pip install -e '.[test]'
 
 The CPU reference backend needs neither a paid GPU nor a pretrained model. The CI workflow is configured to test that path on Ubuntu with Python 3.11 and 3.12.
 
-For accelerated training, first configure a compatible CUDA PyTorch and build environment, then install the optional scan dependencies:
+For training with official Mamba, first configure a compatible Linux CUDA PyTorch and build environment, then install the optional dependencies (see the versioned recipe in [training.md](docs/training.md)):
 
 ```bash
-python -m pip install -e '.[cuda]'
+python -m pip install -e '.[cuda]' --no-build-isolation
 ```
 
-Pass `model.scan_backend=mamba_ssm` to require the CUDA scan kernel and fail clearly if it is unavailable. The supplied `auto` setting can fall back to the much slower reference implementation. Initial verification is CPU-only: CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
+All four Hydra model presets select `model.mixer_impl=mamba_ssm`: the complete official Mamba-1 block, including parameter initialization, sequence processing, and recurrent inference. This architecture never falls back to the custom mixer. `model.scan_backend=auto` is retained for configuration compatibility; changing scan kernels applies only to `model.mixer_impl=legacy`. CPU smoke tests select that legacy architecture explicitly. CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
+
+Checkpoints without `mixer_impl` are treated as legacy. To resume them, explicitly set `model.mixer_impl=legacy`; they cannot initialize or resume an official-Mamba run by renaming keys. Official checkpoints require `--device cuda` for inference, evaluation, benchmarking, and export. CPU/phone execution of that architecture remains future work.
 
 The trainer supports one device or PyTorch DDP for regression and adversarial training. The integration suite exercises two CPU/Gloo processes, gradient accumulation, decoder transitions, checkpoint resume, and comparison with an equivalent single-process batch. CUDA/NCCL correctness, memory use, and scaling still require GPU validation.
 
@@ -49,6 +51,8 @@ Each JSONL row has paths relative to the manifest and an explicit sample rate:
 
 The two recordings must be mono, have the same sample rate and length, and already be aligned. The initial dataset loader rejects other rates instead of silently resampling. Keep validation speakers and recordings separate from training.
 
+Optional training corruption uses `audiomentations` for Gaussian noise, clipping, and low-pass filtering. Install `.[augmentation]` and set `data.augmentation.enabled=true`; see [the data contract](data/README.md#targets-and-synthetic-degradations) for ranges, alignment, and cached-teacher restrictions. It is disabled by default and does not implement the full URGENT data pipeline.
+
 ## Run a smoke test
 
 ```bash
@@ -59,7 +63,7 @@ python -m realtime_use.train \
   output_dir=runs/smoke4
 ```
 
-Smoke mode overrides the supplied architecture with **one block at width 4** and runs at most three tiny synthetic steps. Its data contains tones and noise. A successful run checks the software path only; it cannot establish speech enhancement quality or the memory/runtime requirements of the real 4-, 8-, or 12-block configurations. Benchmark those configurations separately on the intended GPU.
+Smoke mode overrides the supplied architecture with **one legacy block at width 4** and runs at most three tiny synthetic steps. Its data contains tones and noise. A successful run checks the software path only; it cannot establish speech enhancement quality or the memory/runtime requirements of the real 4-, 8-, or 12-block configurations. Benchmark those configurations separately on the intended GPU.
 
 ## Train fixed-depth baselines
 
@@ -113,7 +117,7 @@ Batch size is per rank: this example accumulates **4 ranks × 2 examples × 4 mi
 
 Hydra `-m` with a distributed job is currently rejected; launch each DDP experiment separately. External `torchrun`, validation sharding, and resume requirements are documented in [training.md](docs/training.md#distributed-training).
 
-The regression loss combines waveform L1 with multi-resolution spectral convergence and log-magnitude losses. These are independently chosen objectives. Their definitions live in `src/realtime_use/losses.py`; they should not be described as a verified copy of the papers' loss implementation.
+The regression loss combines PyTorch waveform L1 with `auraloss` multi-resolution spectral convergence and log-magnitude losses. A small adapter crops each utterance to its valid length and gives utterances equal weight. These are explicitly configured objectives, not a verified copy of the papers' loss implementation. The old custom loss is retained only as `loss.implementation=legacy` for prior experiments; native resume must preserve the objective.
 
 The trainer writes a native Lightning checkpoint at `checkpoints/last.ckpt` inside the run's output directory. With a validation manifest, it can select `checkpoints/best.ckpt` using held-out reconstruction loss averaged over exits. Validation uses fixed crops and the configured validation limit; this selection metric is not UTMOS, a listening-test result, or a full official benchmark.
 
@@ -163,12 +167,13 @@ After training a flexible model, extract one of its trained exits:
 python -m realtime_use.export \
   --checkpoint runs/flexible12-regression/checkpoints/last.ckpt \
   --exit-depth 4 \
+  --device cuda \
   --output runs/export/exit4.pt
 ```
 
 This retains the encoder, first four blocks, and the matching trained decoder. It removes the deeper blocks, other decoder heads, and training optimizer/discriminator state. The resulting inference checkpoint can be used by the inference and benchmark commands below. Selecting an exit at runtime alone does not remove the unused weights from a full model's checkpoint.
 
-Export verifies full/streaming output equivalence on a short deterministic CPU sample and refuses to overwrite an existing destination. This is a structural correctness check, not a quality or speed benchmark. Exported checkpoints are for inference; preserve the original training checkpoint for resuming training.
+Export verifies full/streaming output equivalence on a short deterministic sample on the selected device and refuses to overwrite an existing destination. Official Mamba export uses CUDA; legacy CPU export uses `--device cpu`. This is a structural correctness check, not a quality or speed benchmark. Exported checkpoints are for inference; preserve the original training checkpoint for resuming training.
 
 ## Enhance and evaluate audio
 
@@ -181,7 +186,7 @@ python -m realtime_use.infer \
   --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --input data/noisy/example.wav \
   --output runs/example-enhanced.wav \
-  --exit-depth 4 --stream --device cpu
+  --exit-depth 4 --stream --device cuda
 ```
 
 Evaluate only exits configured in that checkpoint:
@@ -191,7 +196,7 @@ python -m realtime_use.evaluate \
   --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --manifest data/validation.jsonl \
   --output runs/fixed4-evaluation.json \
-  --exits 4 --stream --check-clean --device cpu
+  --exits 4 --stream --check-clean --device cuda
 ```
 
 Benchmark the actual streaming path independently from quality evaluation:
@@ -201,26 +206,27 @@ python -m realtime_use.benchmark \
   --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --output runs/fixed4-timing.json \
   --exit-depth 4 --seconds 10 --warmup-seconds 1 \
-  --device cpu --threads 1
+  --device cuda --threads 1
 ```
 
 The benchmark uses synthetic timing input unless `--input` supplies a recording. Its timing results do not establish enhancement quality. Increase the measurement duration for a deployment decision and repeat on the actual target hardware.
 
 ## Measure before scaling
 
-With the supplied width-64, expansion-4, state-dimension-16 configurations, the current implementation has these measured active parameter counts:
+The earlier **legacy mixer** with width 64, expansion 4, and state dimension 16 has these measured active parameter counts. They do not describe the new official-Mamba presets:
 
 - Four-block exit: **863,426**.
 - Eight-block exit: **1,687,746**.
 - Twelve-block exit: **2,512,066**.
 
-An enhancement-only flexible 12-block model stores 2,512,066 parameters with a shared decoder and 2,586,438 with three per-exit decoders. Active counts include one selected decoder. The Lightning training module/checkpoint can additionally retain transition heads, discriminators, and optimizer state; these inference-model counts are not its total memory footprint. Re-measure after architecture changes:
+An enhancement-only legacy flexible 12-block model stores 2,512,066 parameters with a shared decoder and 2,586,438 with three per-exit decoders. Active counts include one selected decoder. The Lightning training module/checkpoint can additionally retain transition heads, discriminators, and optimizer state; these inference-model counts are not its total memory footprint. Measure the official-Mamba architecture in an environment with that dependency installed:
 
 ```python
 from realtime_use.config import ModelConfig
 from realtime_use.model import Enhancer
 
-model = Enhancer(ModelConfig(depth=12, exits=(4, 8, 12)))
+model = Enhancer(ModelConfig(depth=12, exits=(4, 8, 12),
+                             mixer_impl="mamba_ssm", scan_backend="auto"))
 for depth in model.config.exits:
     print(depth, model.active_parameter_count(depth))
 ```

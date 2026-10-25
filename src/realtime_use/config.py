@@ -19,6 +19,7 @@ class ModelConfig:
     expand: int = 4
     conv_kernel: int = 4
     decoder_mode: str = "shared"
+    mixer_impl: str = "legacy"
     scan_backend: str = "reference"
 
     def __post_init__(self) -> None:
@@ -41,8 +42,13 @@ class ModelConfig:
             raise ValueError("Each exit must be an integer between 1 and depth")
         if self.decoder_mode not in {"shared", "per_exit"}:
             raise ValueError("decoder_mode must be shared or per_exit")
+        if self.mixer_impl not in {"legacy", "mamba_ssm"}:
+            raise ValueError("mixer_impl must be legacy or mamba_ssm")
         if self.scan_backend not in {"reference", "auto", "mamba_ssm"}:
             raise ValueError("scan_backend must be reference, auto, or mamba_ssm")
+        if self.mixer_impl == "mamba_ssm" and self.scan_backend != "auto":
+            raise ValueError("The official mamba_ssm mixer requires scan_backend=auto; "
+                             "scan_backend selects kernels only for mixer_impl=legacy")
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "ModelConfig":

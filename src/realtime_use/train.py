@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 from datetime import timedelta
-import math
 import os
 from pathlib import Path
 import sys
@@ -15,7 +14,7 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.types import RunMode
 from hydra.utils import to_absolute_path
 import lightning as L
-from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import DictConfig, OmegaConf
@@ -26,28 +25,26 @@ from .datamodule import PairedAudioDataModule
 from .lightning_module import EnhancementModule
 
 
-class TrainingCheckpoints(Callback):
-    """Save native Lightning checkpoints only at complete generator updates."""
+class UpdateBoundaryCheckpoint(ModelCheckpoint):
+    """Let Lightning manage saves, but never serialize a partial manual update."""
 
-    def __init__(self, directory: Path, every_updates: int):
-        self.directory = directory
-        self.every_updates = every_updates
-        self.best_score: float | None = None
-        self.last_periodic_update = -1
-        self.final_validation_rng: dict[str, Any] | None = None
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if pl_module.microbatches_in_update == 0:
+            super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
 
-    def state_dict(self) -> dict[str, Any]:
-        return {"best_score": self.best_score, "last_periodic_update": self.last_periodic_update}
 
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.best_score = state_dict.get("best_score")
-        self.last_periodic_update = state_dict.get("last_periodic_update", -1)
+class RunArtifacts(Callback):
+    """Project run metadata and final generator-update boundary semantics."""
+
+    def __init__(self, periodic: ModelCheckpoint):
+        self.periodic = periodic
+
+    @property
+    def directory(self) -> Path:
+        # ModelCheckpoint.setup already broadcasts and resolves this path.
+        return Path(self.periodic.dirpath)
 
     def on_fit_start(self, trainer, pl_module) -> None:
-        # A re-executed Hydra worker may initially resolve a different run path.
-        # Rank zero owns artifacts; every rank must use the same checkpoint path.
-        shared = trainer.strategy.broadcast(str(self.directory), src=0)
-        self.directory = Path(shared)
         exists = trainer.strategy.broadcast(
             (self.directory / "last.ckpt").exists() if trainer.is_global_zero else False, src=0)
         if exists and not pl_module.config.get("resume"):
@@ -59,46 +56,54 @@ class TrainingCheckpoints(Callback):
             OmegaConf.save(OmegaConf.create(settings), self.directory.parent / "resolved_config.yaml")
         trainer.strategy.barrier("run artifacts")
 
-    def _save(self, trainer: L.Trainer, name: str) -> None:
-        if trainer.is_global_zero:
-            self.directory.mkdir(parents=True, exist_ok=True)
-        # All ranks participate: checkpoint hooks gather per-rank RNG state.
-        trainer.save_checkpoint(self.directory / name, weights_only=False)
-
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-        update = int(pl_module.completed_updates)
-        if pl_module.microbatches_in_update or update == self.last_periodic_update:
-            return
-        if update and update % self.every_updates == 0:
-            self.last_periodic_update = update
-            self._save(trainer, f"step_{update:07d}.ckpt")
-            self._save(trainer, "last.ckpt")
+        # The public stop flag makes Lightning run final validation within fit,
+        # even when the update budget isn't a validation-interval multiple.
+        if (pl_module.microbatches_in_update == 0
+                and int(pl_module.completed_updates) >= pl_module.target_updates):
+            trainer.should_stop = True
 
-    def on_validation_end(self, trainer, pl_module) -> None:
-        if self.final_validation_rng is not None:
-            # A standalone Trainer.validate() sets up DDP again (and reseeds).
-            # Validation must not rewrite the training RNG saved in best.ckpt.
-            pl_module.restore_rng_state(self.final_validation_rng)
-        if trainer.sanity_checking or not int(pl_module.completed_updates):
-            return
-        if pl_module.microbatches_in_update:
-            raise RuntimeError("Validation/checkpointing must run at an optimizer-update boundary")
-        value = trainer.callback_metrics.get("validation_mean_clean_loss")
-        if value is None:
-            return
-        score = float(value)
-        if not math.isfinite(score):
-            raise FloatingPointError("Nonfinite validation score")
-        if self.best_score is None or score < self.best_score:
-            self.best_score = score
-            self._save(trainer, "best.ckpt")
+    def on_train_end(self, trainer, pl_module) -> None:
+        # Native save_last follows its periodic schedule; always refresh the
+        # final state too, on all ranks, before strategy teardown moves devices.
+        trainer.save_checkpoint(self.directory / "last.ckpt", weights_only=False)
 
-    def on_validation_start(self, trainer, pl_module) -> None:
-        if self.final_validation_rng is not None:
-            pl_module.restore_rng_state(self.final_validation_rng)
 
-    def on_fit_end(self, trainer, pl_module) -> None:
-        self._save(trainer, "last.ckpt")
+def checkpoint_callbacks(settings: dict[str, Any]) -> tuple[RunArtifacts, list[ModelCheckpoint]]:
+    training = settings["training"]
+    count = 2 if training["stage"] == "adversarial" else 1
+    directory = str(Path(settings["output_dir"]) / "checkpoints")
+    periodic = UpdateBoundaryCheckpoint(dirpath=directory,
+        filename="step_{completed_updates:07.0f}", auto_insert_metric_name=False,
+        save_top_k=-1, save_last=True, enable_version_counter=False,
+        every_n_train_steps=training["checkpoint_every"] * count,
+        every_n_epochs=0, save_on_train_epoch_end=False)
+    best = ModelCheckpoint(dirpath=directory, filename="best",
+        monitor="validation_mean_clean_loss", mode="min", save_top_k=1,
+        enable_version_counter=False, every_n_train_steps=0, every_n_epochs=1,
+        save_on_train_epoch_end=False)
+    return RunArtifacts(periodic), [periodic, best]
+
+
+def restore_legacy_best_score(settings: dict[str, Any], checkpoint: dict[str, Any],
+                              best: ModelCheckpoint) -> None:
+    """Import the old selector once; subsequent ranking belongs to Lightning."""
+    states = checkpoint.get("callbacks", {})
+    legacy = states.get("TrainingCheckpoints", {})
+    if (not settings.get("resume") or best.state_key in states
+            or legacy.get("best_score") is None):
+        return
+    directory = Path(best.dirpath).resolve()
+    best_path = directory / "best.ckpt"
+    if Path(settings["resume"]).resolve().parent != directory or not best_path.is_file():
+        return
+    score = torch.tensor(float(legacy["best_score"]))
+    if not bool(torch.isfinite(score)):
+        raise ValueError("Legacy checkpoint contains a nonfinite best validation score")
+    state = best.state_dict()
+    state.update(best_model_score=score, best_model_path=str(best_path),
+                 best_k_models={str(best_path): score}, kth_best_model_path=str(best_path), kth_value=score)
+    best.load_state_dict(state)
 
 
 def prepare_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
@@ -106,7 +111,7 @@ def prepare_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
     settings = copy.deepcopy(settings)
     if settings.get("smoke", False):
         settings["model"].update(depth=1, exits=[1], width=4, state_dim=2, expand=1,
-                                  decoder_mode="shared", scan_backend="reference")
+                                  decoder_mode="shared", mixer_impl="legacy", scan_backend="reference")
         settings["training"].update(steps=min(3, int(settings["training"]["steps"])),
             batch_size=1, crop_seconds=0.08, workers=0, grad_accum=1,
             split_decoders_at=None, checkpoint_every=1, log_every=1,
@@ -141,7 +146,7 @@ def prepare_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
     nodes = trainer.get("num_nodes", 1)
     if isinstance(nodes, bool) or not isinstance(nodes, int) or nodes < 1:
         raise ValueError("trainer.num_nodes must be a positive integer")
-    reserved = {"max_steps", "max_epochs", "accumulate_grad_batches", "gradient_clip_val", "callbacks",
+    reserved = {"max_steps", "max_epochs", "min_steps", "min_epochs", "accumulate_grad_batches", "gradient_clip_val", "callbacks",
                 "logger", "enable_checkpointing", "val_check_interval", "check_val_every_n_epoch",
                 "limit_val_batches", "default_root_dir", "log_every_n_steps", "use_distributed_sampler"}
     if reserved.intersection(trainer):
@@ -194,7 +199,11 @@ def _checkpoint_config(settings: dict[str, Any], checkpoint: dict[str, Any]) -> 
         previous = checkpoint.get("hyper_parameters", {}).get("config", {})
         # Changing optimizer structure/objective mid-resume is a fresh experiment.
         for group in ("loss", "adversarial"):
-            if group in previous and previous[group] != settings[group]:
+            old_group, new_group = dict(previous.get(group, {})), dict(settings[group])
+            if group == "loss":
+                old_group.setdefault("implementation", "legacy")
+                new_group.setdefault("implementation", "legacy")
+            if group in previous and old_group != new_group:
                 raise ValueError(f"resume must preserve {group}; use init_from for a fresh experiment")
         for key in ("lr", "weight_decay", "grad_accum", "predecoder_lr_scale", "sample_exit", "split_decoders_at"):
             old = previous.get("training", {})
@@ -223,28 +232,21 @@ def run_training(cfg: DictConfig | dict[str, Any]) -> Path:
     if checkpoint is not None and settings.get("init_from"):
         module.load_portable_weights(checkpoint)
     training = settings["training"]
-    checkpoints = TrainingCheckpoints(destination / "checkpoints", training["checkpoint_every"])
+    artifacts, checkpoints = checkpoint_callbacks(settings)
+    if checkpoint is not None:
+        restore_legacy_best_score(settings, checkpoint, checkpoints[1])
     optimizer_count = 2 if training["stage"] == "adversarial" else 1
     trainer = L.Trainer(**trainer_options(settings),
         default_root_dir=str(destination),
         max_steps=training["steps"] * optimizer_count, max_epochs=-1,
-        accumulate_grad_batches=1, enable_checkpointing=False, use_distributed_sampler=False,
-        callbacks=[checkpoints], logger=CSVLogger(str(destination), name="metrics"),
+        accumulate_grad_batches=1, enable_checkpointing=True, use_distributed_sampler=False,
+        callbacks=[artifacts, *checkpoints], logger=CSVLogger(str(destination), name="metrics"),
         log_every_n_steps=training["log_every"],
         limit_val_batches=training["validation_batches"] if data.has_validation else 0,
         val_check_interval=training["validate_every"] * training["grad_accum"],
         check_val_every_n_epoch=None)
     trainer.fit(module, datamodule=data, ckpt_path=settings.get("resume"))
-    # Also evaluate the final update when its budget is not a validation multiple.
-    if data.has_validation and int(module.completed_updates) % training["validate_every"]:
-        checkpoints.final_validation_rng = module.capture_rng_state()
-        try:
-            trainer.validate(module, datamodule=data, verbose=False)
-        finally:
-            module.restore_rng_state(checkpoints.final_validation_rng)
-            checkpoints.final_validation_rng = None
-        checkpoints._save(trainer, "last.ckpt")
-    return checkpoints.directory / "last.ckpt"
+    return artifacts.directory / "last.ckpt"
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")

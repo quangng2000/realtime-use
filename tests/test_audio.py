@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch.nn import functional as F
 
 from realtime_use.audio import SpectralTransform, StreamingEnhancer
 from realtime_use.config import ModelConfig
@@ -22,6 +23,42 @@ def test_transform_roundtrip_and_gradient(length):
     torch.testing.assert_close(audio, reconstructed, atol=3e-4, rtol=3e-4)
     reconstructed.square().mean().backward()
     assert torch.isfinite(audio.grad).all()
+
+
+def _explicit_overlap_add_reference(transform, spectrum, length):
+    """Frozen pre-ISTFT implementation to verify edited spectra and gradients."""
+    batch, frames, _ = spectrum.shape
+    width, hop = transform.window_samples, transform.hop_samples
+    size = (frames - 1) * hop + width
+    window = transform.window.float()
+    signal = torch.fft.irfft(spectrum, n=width, dim=-1) * window
+    output = F.fold(signal.transpose(1, 2), (1, size), (1, width), stride=(1, hop))
+    weights = window.square().view(1, -1, 1).expand(1, -1, frames)
+    denominator = F.fold(weights, (1, size), (1, width), stride=(1, hop))
+    restored = (output / denominator.clamp_min(1e-8)).reshape(batch, size)
+    return restored[:, hop:hop + length]
+
+
+@pytest.mark.parametrize("window_ms,hop_ms", [(40, 20), (10, 5), (0.125, 0.0625)])
+@pytest.mark.parametrize("length_kind", ["one", "before_hop", "hop", "after_hop", "partial_tail"])
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+def test_istft_matches_explicit_overlap_add_for_edited_spectra_and_gradients(window_ms, hop_ms, length_kind, dtype):
+    transform = SpectralTransform(16000, window_ms, hop_ms)
+    hop = transform.hop_samples
+    length = {"one": 1, "before_hop": max(1, hop - 1), "hop": hop,
+              "after_hop": hop + 1, "partial_tail": 3 * hop + 17}[length_kind]
+    generator = torch.Generator().manual_seed(781)
+    # Arbitrary complex edits, including imaginary DC/Nyquist components, are
+    # intentionally not restricted to spectra produced by waveform analysis.
+    spectrum = torch.randn(2, transform.frame_count(length), transform.window_samples // 2 + 1,
+                           dtype=dtype, generator=generator, requires_grad=True)
+    expected = _explicit_overlap_add_reference(transform, spectrum, length)
+    actual = transform.synthesis(spectrum, length)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    probe = torch.randn(actual.shape, dtype=actual.dtype, generator=generator)
+    expected_gradient = torch.autograd.grad((expected * probe).sum(), spectrum, retain_graph=True)[0]
+    actual_gradient = torch.autograd.grad((actual * probe).sum(), spectrum)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("length", [1, 15, 31, 32, 33, 48, 49, 157])

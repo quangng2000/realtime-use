@@ -44,17 +44,15 @@ class SpectralTransform(nn.Module):
             raise ValueError("Expected nonempty complex spectrum [batch, frames, bins]")
         if spectrum.shape[-1] != self.window_samples // 2 + 1:
             raise ValueError("Spectrum bin count does not match transform")
-        batch, frames, _ = spectrum.shape
+        frames = spectrum.shape[1]
         size = (frames - 1) * self.hop_samples + self.window_samples
         if not 0 < length <= size - 2 * self.hop_samples:
             raise ValueError("Requested length must fit the synthesized frames")
-        window = self.window.float()
-        signal = torch.fft.irfft(spectrum, n=self.window_samples, dim=-1) * window
-        output = F.fold(signal.transpose(1, 2), (1, size), (1, self.window_samples), stride=(1, self.hop_samples))
-        weights = window.square().view(1, -1, 1).expand(1, -1, frames)
-        denominator = F.fold(weights, (1, size), (1, self.window_samples), stride=(1, self.hop_samples))
-        restored = (output / denominator.clamp_min(1e-8)).reshape(batch, size)
-        return restored[:, self.hop_samples:self.hop_samples + length]
+        # The inverse trims the explicit past half-window padding from analysis.
+        # center=True here adds no analysis lookahead or streaming buffering.
+        return torch.istft(spectrum.transpose(1, 2), n_fft=self.window_samples,
+                           hop_length=self.hop_samples, window=self.window.float(),
+                           center=True, length=length)
 
 
 class StreamingEnhancer:

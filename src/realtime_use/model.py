@@ -12,7 +12,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .config import ModelConfig
-from .ssm import SelectiveMixer
+from .ssm import OfficialMambaMixer, SelectiveMixer
 
 
 class CausalFeatureConv(nn.Module):
@@ -37,10 +37,14 @@ class TimeFrequencyBlock(nn.Module):
         super().__init__()
         self.frequency_norm = nn.LayerNorm(cfg.width)
         self.time_norm = nn.LayerNorm(cfg.width)
-        self.frequency_forward = SelectiveMixer(cfg.width, cfg.state_dim, cfg.expand, cfg.conv_kernel, cfg.scan_backend)
-        self.frequency_backward = SelectiveMixer(cfg.width, cfg.state_dim, cfg.expand, cfg.conv_kernel, cfg.scan_backend)
+        mixer_type = OfficialMambaMixer if cfg.mixer_impl == "mamba_ssm" else SelectiveMixer
+        mixer_args = (cfg.width, cfg.state_dim, cfg.expand, cfg.conv_kernel)
+        if cfg.mixer_impl == "legacy":
+            mixer_args += (cfg.scan_backend,)
+        self.frequency_forward = mixer_type(*mixer_args)
+        self.frequency_backward = mixer_type(*mixer_args)
         self.frequency_merge = nn.Linear(2 * cfg.width, cfg.width)
-        self.temporal = SelectiveMixer(cfg.width, cfg.state_dim, cfg.expand, cfg.conv_kernel, cfg.scan_backend)
+        self.temporal = mixer_type(*mixer_args)
 
     def _frequency(self, x: Tensor) -> Tensor:
         values = self.frequency_norm(x)

@@ -2,11 +2,49 @@
 
 Training uses a LightningModule, an aligned-audio LightningDataModule, and Hydra configuration composition. The model, losses, and method limitations described in [method.md](method.md) are unchanged by this orchestration choice.
 
+## Library responsibilities and project-specific code
+
+Hydra composes configurations and launches independent sweeps. Lightning owns process setup, optimizer and loop restoration, precision handling, CSV logging, and checkpoint selection and serialization. Two native `ModelCheckpoint` callbacks manage periodic snapshots and the lowest validation loss; the project does not maintain a separate best-score tracker.
+
+New model presets use the official Mamba-1 class. PyTorch supplies STFT/iSTFT and waveform L1, `auraloss` supplies multi-resolution spectral losses, TorchMetrics supplies validation means and signal-quality formulas, and optional `audiomentations` transforms supply training corruptions. Project adapters handle valid utterance lengths, paired-data semantics, and stream/exit selection. The legacy mixer and spectral loss remain available for existing checkpoints; they are not the default Hydra training recipe.
+
+`loss.implementation=auraloss` uses centered Hann STFTs with hop sizes one quarter of each configured FFT size, spectral-convergence and log-magnitude weights of one, and no phase/perceptual term. Valid utterance prefixes are evaluated separately so batch composition and DDP sharding do not alter their relative weights. Very short prefixes receive deterministic zero extension for the library's reflection padding. This objective differs from the previous uncentered custom loss. To resume an older run, select both `model.mixer_impl=legacy` and `loss.implementation=legacy`; resume rejects an objective or architecture change. `init_from` can deliberately start a new objective with compatible architecture and fresh optimizer state.
+
+The remaining checkpoint adapter checks that manual gradient accumulation has finished before delegating a periodic save. A small run callback writes the resolved configuration, rejects accidental reuse of an existing run, signals the generator-update budget, and refreshes `last.ckpt` on every rank before distributed teardown. Signaling the budget also lets Lightning run any final validation inside `fit`, including when the budget is not a validation-interval multiple.
+
+Model-specific code still defines the causal enhancement network, losses, two-optimizer GAN update, decoder transition, synchronized exit sampling, and valid-example accounting for distributed validation. These are project implementation choices; using Lightning does not establish equivalence to the papers or add missing data augmentation.
+
+## Official Mamba CUDA environment
+
+The CUDA extra pins the complete upstream Mamba-1 implementation to `mamba-ssm==2.2.6.post3` and its causal convolution extension to `causal-conv1d==1.6.0`. The adapter calls the upstream [Mamba class](https://github.com/state-spaces/mamba/blob/v2.2.6.post3/mamba_ssm/modules/mamba_simple.py), including its initialization, sequence forward pass, inference cache, and token step. This dependency is separate from NVIDIA's RE-USE implementation and pretrained weights. Mamba carries the [Apache-2.0 license](https://github.com/state-spaces/mamba/blob/v2.2.6.post3/LICENSE); causal-conv1d carries the [BSD-3-Clause license](https://github.com/Dao-AILab/causal-conv1d/blob/v1.6.0/LICENSE).
+
+The following is a compatible installation candidate for **Linux x86_64, Python 3.11, CUDA 12.8, and PyTorch 2.7.1**. It has not been installed or runtime-validated on a CUDA machine by this project. The [Mamba release](https://github.com/state-spaces/mamba/releases/tag/v2.2.6.post3) and [causal-conv1d release](https://github.com/Dao-AILab/causal-conv1d/releases/tag/v1.6.0) publish matching Python 3.11 / PyTorch 2.7 / CUDA 12 wheels. The PyTorch command follows its [versioned installation instructions](https://pytorch.org/get-started/previous-versions/#v271).
+
+Start in the repository root with an NVIDIA driver compatible with CUDA 12.8 and a CUDA 12.8 development toolkit, including `nvcc`, available. A CUDA runtime-only image may lack the compiler needed by extension metadata or a source-build fallback.
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel packaging ninja
+python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+nvcc --version
+python -m pip install --no-build-isolation -e ".[cuda,test]"
+python -m pip check
+```
+
+Install PyTorch before the extensions and retain `--no-build-isolation`, so their build uses that installed CUDA-enabled PyTorch. These commands target the pinned releases and their [release build setup](https://github.com/state-spaces/mamba/blob/v2.2.6.post3/setup.py); newer upstream `main` installation flags can differ. The Mamba-1 pin avoids adding the unrelated Mamba-3 dependency stack. It is not a claim that this is the newest Mamba package.
+
+For Linux CPU development, install a CPU PyTorch wheel first (`python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu`), then `python -m pip install -e ".[test]"`. Do not install the CUDA extra for CPU smoke tests. The smoke configuration selects the legacy reference mixer; it does not exercise the official CUDA class.
+
+Official Mamba checkpoints require `--device cuda` for inference, evaluation, benchmarking, and exit export. Loading one on CPU raises an error rather than changing its architecture. Export retains the chosen official Mamba blocks and verifies full/stream outputs on the requested CUDA device. Legacy checkpoints keep their original parameter layout and CPU reference support; they cannot initialize the official architecture through a backend switch.
+
+Run `python -m pytest -q tests/test_official_mamba.py` on that CUDA host before a training job. These tests exercise the actual class, gradients, streaming state, exit export, and regression/GAN checkpoint continuation. Without CUDA, numerical tests are skipped; on a CUDA host, missing or broken Mamba dependencies fail instead of passing through a mock.
+
 ## Configuration groups
 
 Canonical configs are packaged under `src/realtime_use/conf`, so the installed command can compose them outside the repository root. The groups are:
 
-- `model`: audio framing, depth, exits, dimensions, decoder mode, and scan backend.
+- `model`: audio framing, depth, exits, dimensions, decoder mode, mixer implementation, and legacy scan backend.
 - `data`: training/validation manifests and data-loading options.
 - `training`: stage, generator-update budget, batch/crop/worker settings, optimizer settings, accumulation, and decoder transition.
 - `loss`: supervised reconstruction and optional cached-output distillation.
@@ -86,9 +124,9 @@ All ranks use the same sampled exit for each training microbatch. Decoder heads 
 
 Validation pads rank workloads where necessary but marks padding rows invalid. Global loss is computed from summed valid-example losses and counts, so a complete pass counts every original validation example once, including when the dataset size is not divisible by world size. `training.validation_batches` limits batches **per rank**; a capped pass may cover only a subset. Use a sufficient limit for a full validation-set result.
 
-Checkpoint participation is collective, while checkpoint files and run logs are written by rank zero. Native resume preserves per-rank random states and requires the same world size; changing world size is a fresh initialization experiment, not an exact resume. Keep architecture, optimizer structure, accumulation, and stage compatible with the checkpoint.
+Checkpoint participation is collective, while checkpoint files and run logs are written by rank zero. Native resume preserves each rank's main-process Python, NumPy, and PyTorch random states and requires the same world size. Worker prefetch/crop order is not replayed exactly; changing world size is a fresh initialization experiment. Keep architecture, optimizer structure, accumulation, and stage compatible with the checkpoint.
 
-For a CPU-only execution check, use `trainer.accelerator=cpu trainer.devices=2 trainer.strategy=ddp` with `smoke=true` and a unique output directory. The smoke model remains tiny. The integration tests also compare actual gradients and Adam moments against an equivalent single-process batch for both regression and GAN; merely completing without a hang would not establish correct gradient reduction.
+For a CPU-only execution check, use `trainer.accelerator=cpu trainer.devices=2 trainer.strategy=ddp` with `smoke=true` and a unique output directory. The smoke model remains tiny and uses the legacy reference mixer. The integration tests also compare actual gradients and Adam moments against an equivalent single-process batch for both regression and GAN; merely completing without a hang would not establish correct gradient reduction.
 
 CUDA/NCCL and multi-node execution have not been exercised by the CPU/Gloo integration tests. Measure GPU memory, mixed-precision behavior, throughput, and scaling separately before a longer run. Launch separate DDP jobs instead of a distributed Hydra multirun.
 
@@ -106,8 +144,8 @@ Use `training.grad_accum` rather than Lightning's automatic `accumulate_grad_bat
 
 The run writes native Lightning checkpoints under `checkpoints/`:
 
-- `last.ckpt`: the latest saved training state.
-- `step_*.ckpt`: periodic snapshots.
+- `last.ckpt`: the latest saved training state, refreshed at normal training completion.
+- `step_*.ckpt`: periodic snapshots named by completed generator updates.
 - `best.ckpt`: selected by `validation_mean_clean_loss` when validation is configured.
 
 The native checkpoint also includes `model_config`, `model_state`, `stage`, and `step` compatibility fields. Existing `infer`, `evaluate`, `benchmark`, and `export` commands can read the enhancement weights without constructing the training loop.
@@ -125,6 +163,8 @@ python -m realtime_use.train \
 ```
 
 The budget is the total desired generator-update count, including completed updates. Lightning restores optimizer/loop state for a compatible run; exact data-order continuation is not guaranteed.
+
+Native checkpoint-selection history is restored when resuming into the same checkpoint directory with the same callback configuration. Lightning resets the score ranking when the checkpoint directory changes, so the example above selects a new best within the continued run. For checkpoints from the earlier custom `TrainingCheckpoints` callback, a small migration imports the saved best score into Lightning only when resuming from that same directory and its `best.ckpt` still exists. Otherwise selection starts a new history; compatible model, optimizer, and loop state can still resume. Keep the earlier `best.ckpt` when comparing across a directory change.
 
 Start a new adversarial stage with `init_from` pointing to a regression checkpoint:
 
@@ -165,6 +205,6 @@ Inference, evaluation, export, and benchmark commands retain their existing flag
 
 ## Smoke and validation scope
 
-`smoke=true` substitutes a one-block, width-4 model and tiny generated data. It caps the generator-update budget at three; set `training.steps=1` or `training.steps=2` for a shorter check. Synthetic validation checks the execution path; it is not a speech-quality result. A sweep of smoke jobs tests configuration and lifecycle handling, not the actual 4-/8-/12-block training cost.
+`smoke=true` substitutes a one-block, width-4 legacy reference model and tiny generated data. It caps the generator-update budget at three; set `training.steps=1` or `training.steps=2` for a shorter check. Synthetic validation checks the execution path; it is not a speech-quality result or validation of official Mamba CUDA execution. A sweep of smoke jobs tests configuration and lifecycle handling, not the actual 4-/8-/12-block training cost.
 
 CPU/Gloo tests do not validate CUDA kernels, NCCL, GPU precision modes, full-size training memory, multi-node execution, or production latency. Measure those independently before allocating a longer run.

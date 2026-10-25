@@ -1,8 +1,9 @@
-"""Selective state-space mixer, implemented from the Mamba equations.
+"""Official Mamba adapter and the legacy portable checkpoint implementation.
 
-The portable recurrence is a correctness reference, not an optimized trainer.
-An optional Apache-2.0 mamba-ssm selective-scan kernel accelerates sequence
-training on CUDA. No NVIDIA RE-USE implementation or checkpoint is used.
+New CUDA models can use the complete upstream Apache-2.0 ``mamba_ssm.Mamba``.
+The independent portable recurrence remains for existing checkpoints and CPU
+checks; its optional selective-scan kernel is a separate legacy backend choice.
+No NVIDIA RE-USE implementation or checkpoint is used.
 """
 
 import math
@@ -14,6 +15,8 @@ from torch.nn import functional as F
 
 
 class SelectiveMixer(nn.Module):
+    """Legacy parameter layout; retained for portable checkpoints and CPU tests."""
+
     def __init__(self, width: int, state_dim: int, expand: int, kernel: int, backend: str):
         super().__init__()
         self.width, self.inner, self.state_dim = width, width * expand, state_dim
@@ -105,3 +108,65 @@ class SelectiveMixer(nn.Module):
         output = self.out_projection(y.to(u.dtype) * F.silu(gate))
         history = window[:, :, 1:] if self.kernel > 1 else window[:, :, :0]
         return output, {"conv": history, "ssm": memory}
+
+
+def _load_official_mamba() -> type[nn.Module]:
+    # Import only when this implementation is explicitly selected. Legacy CPU
+    # checkpoints must remain usable without importing compiled CUDA extensions.
+    try:
+        from mamba_ssm import Mamba
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "mixer_impl=mamba_ssm requires the official mamba-ssm package and compatible "
+            "PyTorch/CUDA extensions. Install this project's cuda extra on an NVIDIA CUDA "
+            "host. Use mixer_impl=legacy only for an explicitly separate CPU model or "
+            "legacy checkpoint; implementations are not interchangeable."
+        ) from error
+    return Mamba
+
+
+class OfficialMambaMixer(nn.Module):
+    """Delegate sequence execution and recurrent caches to upstream Mamba.
+
+    Construction may occur on CPU before Lightning places the model on CUDA.
+    Numerical execution requires CUDA; there is no architecture fallback. Cache
+    tensors belong to the caller's stream and upstream ``step`` updates them in
+    place. Clone both tensors when branching or saving an intermediate stream.
+    """
+
+    def __init__(self, width: int, state_dim: int, expand: int, kernel: int) -> None:
+        super().__init__()
+        self.width, self.inner, self.state_dim = width, width * expand, state_dim
+        self.kernel = kernel
+        self.mamba = _load_official_mamba()(
+            d_model=width, d_state=state_dim, d_conv=kernel, expand=expand,
+        )
+
+    def _check_cuda(self, value: Tensor) -> None:
+        if not value.is_cuda or next(self.mamba.parameters()).device != value.device:
+            raise RuntimeError(
+                "The official mamba_ssm mixer requires input and model on the same CUDA "
+                "device. Select trainer.accelerator=gpu for training or --device cuda "
+                "for inference; official checkpoints cannot fall back to the legacy CPU mixer."
+            )
+
+    def forward(self, sequence: Tensor) -> Tensor:
+        if sequence.ndim != 3 or sequence.shape[1] < 1 or sequence.shape[2] != self.width:
+            raise ValueError("Expected nonempty [batch, length, width] matching the Mamba width")
+        self._check_cuda(sequence)
+        return self.mamba(sequence)
+
+    def step(self, token: Tensor, state: dict[str, Tensor] | None = None) -> tuple[Tensor, dict[str, Tensor]]:
+        if token.ndim != 2 or token.shape[1] != self.width:
+            raise ValueError("Expected [batch, width] matching the Mamba width")
+        self._check_cuda(token)
+        if state is None:
+            conv, memory = self.mamba.allocate_inference_cache(batch_size=token.shape[0], max_seqlen=1)
+        else:
+            conv, memory = state["conv"], state["ssm"]
+            if (conv.shape != (token.shape[0], self.inner, self.kernel)
+                    or memory.shape != (token.shape[0], self.inner, self.state_dim)
+                    or conv.device != token.device or memory.device != token.device):
+                raise ValueError("Mamba stream shape or device changed; reset its state")
+        output, conv, memory = self.mamba.step(token.unsqueeze(1), conv, memory)
+        return output.squeeze(1), {"conv": conv, "ssm": memory}

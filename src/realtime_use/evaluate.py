@@ -9,18 +9,24 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
+import torchmetrics
+from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio, signal_noise_ratio
 
 from .data import PairedAudioDataset, SyntheticDataset
 from .infer import enhance_waveform, load_model
 
 
 METRIC_IMPLEMENTATIONS = {
-    "mse": "Mean squared sample error in original waveform amplitude; lower is better.",
-    "snr_db": "10*log10(mean(reference^2)/mean((estimate-reference)^2)); no gain/time alignment.",
-    "si_sdr_db": "Zero-mean utterance SI-SDR, least-squares scalar projection onto reference; no time alignment.",
+    "revision": 2,
+    "versions": {"torch": str(torch.__version__), "torchmetrics": torchmetrics.__version__},
+    "mse": "torch.nn.functional.mse_loss(reduction='mean'); original waveform amplitude, lower is better.",
+    "snr_db": "torchmetrics.functional.audio.signal_noise_ratio(zero_mean=False); no gain/time alignment.",
+    "si_sdr_db": "torchmetrics.functional.audio.scale_invariant_signal_distortion_ratio(zero_mean=True); no time alignment.",
     "si_sdr_improvement_db": "Per-utterance enhanced SI-SDR minus noisy-bypass SI-SDR.",
     "aggregation": "Unweighted mean across utterances; undefined values are excluded and counts are reported.",
-    "numerics": "Float64 arithmetic, power floor 1e-12. Reference RMS <=1e-8 gives undefined SNR/SI-SDR; silent estimate gives undefined SI-SDR.",
+    "numerics": "CPU float64 with TorchMetrics dtype-epsilon regularization of summed energies. Replaces the earlier custom 1e-12 mean-power floor; results can differ, especially for perfect or very quiet signals. Nonfinite inputs or computed values raise an error.",
+    "undefined_values": "Project reporting policy: reference RMS <=1e-8 gives null SNR; centered reference or centered estimate RMS <=1e-8 gives null SI-SDR. Null values are excluded from aggregates.",
 }
 
 
@@ -34,19 +40,14 @@ def signal_metrics(estimate: torch.Tensor, reference: torch.Tensor) -> dict[str,
         raise ValueError("metrics require finite samples")
     reference_power = float(reference.square().mean())
     estimate_power = float(estimate.square().mean())
-    mse = float((estimate - reference).square().mean())
+    mse = float(F.mse_loss(estimate, reference, reduction="mean"))
     silent_reference = reference_power <= 1e-16
-    snr = None if silent_reference else 10 * math.log10(max(reference_power, 1e-12) / max(mse, 1e-12))
-    centered_reference = reference - reference.mean()
-    centered_estimate = estimate - estimate.mean()
-    centered_power = float(centered_reference.square().mean())
+    snr = None if silent_reference else float(signal_noise_ratio(estimate, reference, zero_mean=False))
     si_sdr = None
-    if centered_power > 1e-16 and float(centered_estimate.square().mean()) > 1e-16:
-        scale = (centered_estimate * centered_reference).sum() / centered_reference.square().sum()
-        projected = scale * centered_reference
-        residual = centered_estimate - projected
-        si_sdr = 10 * math.log10(max(float(projected.square().mean()), 1e-12) / max(float(residual.square().mean()), 1e-12))
-    return {
+    # Keep undefined silence/DC reporting separate from the library formula.
+    if float(reference.var(unbiased=False)) > 1e-16 and float(estimate.var(unbiased=False)) > 1e-16:
+        si_sdr = float(scale_invariant_signal_distortion_ratio(estimate, reference, zero_mean=True))
+    result = {
         "mse": mse,
         "snr_db": snr,
         "si_sdr_db": si_sdr,
@@ -54,6 +55,9 @@ def signal_metrics(estimate: torch.Tensor, reference: torch.Tensor) -> dict[str,
         "estimate_rms": math.sqrt(estimate_power),
         "silent_reference": silent_reference,
     }
+    if any(value is not None and not math.isfinite(value) for value in result.values()):
+        raise ValueError("metrics require finite computed values; samples exceed the supported numeric range")
+    return result
 
 
 def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:

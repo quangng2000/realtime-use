@@ -17,6 +17,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from .augmentation import build_input_augmentation
+
 
 def read_mono_audio(path: str | Path, sample_rate: int) -> torch.Tensor:
     """Read finite mono audio at the exact requested rate, without conversion."""
@@ -40,6 +42,8 @@ class PairedAudioDataset(Dataset):
     training examples receive identical right padding across every target.
     Set load_teacher=False when distillation is disabled to avoid accessing any
     teacher files, including teacher paths retained in a reused manifest.
+    Optional augmentation corrupts only the valid noisy crop during training,
+    before padding. It cannot be combined with cached teacher loading.
     """
 
     def __init__(
@@ -49,6 +53,7 @@ class PairedAudioDataset(Dataset):
         crop_samples: int | None = None,
         training: bool = True,
         load_teacher: bool = True,
+        augmentation: dict[str, Any] | None = None,
     ) -> None:
         if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
             raise ValueError("sample_rate must be a positive integer")
@@ -61,6 +66,9 @@ class PairedAudioDataset(Dataset):
         self.crop_samples = crop_samples
         self.training = training
         self.load_teacher = load_teacher
+        self.augmentation = build_input_augmentation(
+            augmentation, sample_rate, training=training, load_teacher=load_teacher,
+        )
         self.records: list[dict[str, Any]] = []
         with self.manifest.open(encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -123,9 +131,13 @@ class PairedAudioDataset(Dataset):
             start = int(torch.randint(available + 1, ()).item()) if self.training and available else 0
             valid_length = min(count, self.crop_samples)
             audio = {
-                key: F.pad(value[start : start + self.crop_samples], (0, max(0, self.crop_samples - count)))
+                key: value[start : start + self.crop_samples]
                 for key, value in audio.items()
             }
+        if self.augmentation is not None:
+            audio["noisy"] = self.augmentation(audio["noisy"])
+        if self.crop_samples is not None and valid_length < self.crop_samples:
+            audio = {key: F.pad(value, (0, self.crop_samples - valid_length)) for key, value in audio.items()}
         return {**audio, "length": valid_length, "id": record["id"]}
 
 
