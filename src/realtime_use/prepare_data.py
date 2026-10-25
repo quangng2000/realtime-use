@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from copy import deepcopy
 import csv
 import hashlib
 import importlib

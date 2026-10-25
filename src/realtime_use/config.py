@@ -1,10 +1,7 @@
 """Validated configuration for independently trained causal baselines."""
 
 from dataclasses import asdict, dataclass, fields
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 
 @dataclass
@@ -89,12 +86,3 @@ class ModelConfig:
     @property
     def supported_sample_rates(self) -> tuple[int, ...]:
         return self.sample_rates or (self.sample_rate,)
-
-
-def load_config(path: str | Path) -> dict[str, Any]:
-    with Path(path).open(encoding="utf-8") as handle:
-        result = yaml.safe_load(handle)
-    if not isinstance(result, dict) or not isinstance(result.get("model"), dict):
-        raise ValueError("Configuration must contain a model mapping")
-    ModelConfig.from_dict(result["model"])
-    return result

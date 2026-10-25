@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 

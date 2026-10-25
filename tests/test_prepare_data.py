@@ -1,7 +1,6 @@
 """Simulator-adapter tests use generated tiny audio; no training or real data."""
 import csv
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np

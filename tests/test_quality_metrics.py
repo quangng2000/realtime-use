@@ -1,10 +1,8 @@
 """Offline adapter contracts; mocked learned scorers are not metric validation."""
-import csv
 import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
-import warnings
 
 import numpy as np
 import pytest
