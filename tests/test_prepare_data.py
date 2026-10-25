@@ -484,3 +484,86 @@ def test_raw_metadata_rejects_malformed_structural_rows(tmp_path, malformed):
     metadata.write_text('\t'.join(header) + '\n' + row + (row if malformed == 'duplicate_id' else ''))
     with pytest.raises(ValueError):
         prep.read_metadata(metadata)
+
+
+def test_threaded_loader_validation_matches_serial_audio_and_is_bounded(tmp_path, monkeypatch):
+    import threading
+    import torch
+
+    manifest = tmp_path / 'pairs.jsonl'
+    rows = []
+    for index in range(6):
+        wave = np.linspace(-.1, .1, 80 + index).astype(np.float32)
+        paths = {key: tmp_path / f'{index}-{key}.wav' for key in ('noisy', 'clean')}
+        for key, path in paths.items():
+            sf.write(path, wave * (.5 if key == 'noisy' else 1), 8000, subtype='FLOAT')
+        rows.append({'id': str(index), 'sample_rate': 8000, 'transcript': f'utterance {index}',
+                     **{key: str(path) for key, path in paths.items()}})
+    manifest.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    original_bytes = manifest.read_bytes()
+    original_getitem = prep.PairedAudioDataset.__getitem__
+    dataset = prep.PairedAudioDataset(manifest, prep.RATE_SET, training=False, load_teacher=False)
+    def summarize(item):
+        return (item['id'], item['transcript'], item['length'], item['sample_rate'],
+                item['noisy'].numpy().tobytes(), item['clean'].numpy().tobytes())
+    expected = {index: summarize(dataset[index]) for index in range(len(dataset))}
+    serial = prep._validate_loader(manifest)
+    observed, threads = {}, set()
+    rendezvous = threading.Barrier(2)
+    def inspect(self, index):
+        # All inputs are immutable; inference must not build/use augmentation or
+        # crops, and each pair is independently decoded by the actual loader.
+        assert self.training is False and self.load_teacher is False
+        assert self.crop_samples is None and self.crop_seconds is None
+        assert all(value is None for value in self.augmentations.values())
+        rendezvous.wait(timeout=5)
+        threads.add(threading.get_ident())
+        item = original_getitem(self, index)
+        observed[index] = summarize(item)
+        return item
+    monkeypatch.setattr(prep.PairedAudioDataset, '__getitem__', inspect)
+    rng = torch.get_rng_state().clone()
+    parallel = prep._validate_loader(manifest, workers=2)
+    assert observed == expected
+    assert len(threads) == 2
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert manifest.read_bytes() == original_bytes
+    assert serial['workers'] == 1 and serial['executor'] == 'in_process'
+    assert parallel['workers'] == 2 and parallel['executor'] == 'threads'
+    assert serial['examples'] == parallel['examples'] == 6
+    assert parallel['max_in_flight'] == 4
+    assert 0 <= parallel['construction_seconds'] <= parallel['total_seconds']
+    assert 0 <= parallel['decode_seconds'] <= parallel['total_seconds']
+
+
+@pytest.mark.parametrize('workers', [1, 2])
+def test_loader_validation_failure_never_publishes_manifest(tmp_path, monkeypatch, workers):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    # Keep the upstream renderer fixture in-process while exercising the actual
+    # threaded loader and publication path with genuine saved audio files.
+    original_render = prep.render_metadata
+    def render(*args, workers=1, **kwargs):
+        return original_render(*args, workers=1, **kwargs)
+    monkeypatch.setattr(prep, 'render_metadata', render)
+    final = prep.execute_preparation(plan, workers=workers)
+    original_manifest = final.read_bytes()
+    report = json.loads((output / 'provenance.json').read_text())
+    assert report['loader_validation']['workers'] == workers
+    assert report['loader_validation']['examples'] == 2
+    assert report['loader_validation']['total_seconds'] >= 0
+    original_getitem = prep.PairedAudioDataset.__getitem__
+    def corrupt_after_header_checks(self, index):
+        if index == 1:
+            sf.write(self.records[index]['clean'], np.full(80, np.nan), 8000, subtype='FLOAT')
+        return original_getitem(self, index)
+    monkeypatch.setattr(prep.PairedAudioDataset, '__getitem__', corrupt_after_header_checks)
+    with pytest.raises(ValueError, match='non-finite'):
+        prep.execute_preparation(plan, workers=workers, resume=True)
+    assert not final.exists()
+    assert (output / 'manifest.previous.jsonl').read_bytes() == original_manifest
+    assert (output / 'manifest.pending.jsonl').is_file()
+    assert counts['render'] == ['fileid_0', 'fileid_1']
+    # A subsequent valid resume repairs the corrupted pair and can publish.
+    monkeypatch.setattr(prep.PairedAudioDataset, '__getitem__', original_getitem)
+    assert prep.execute_preparation(plan, workers=workers, resume=True).read_bytes() == original_manifest
+    assert counts['render'] == ['fileid_0', 'fileid_1', 'fileid_1']

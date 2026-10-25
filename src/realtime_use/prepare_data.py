@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager, nullcontext
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing
 import hashlib
 import importlib
@@ -727,6 +727,54 @@ def _ensure_metadata(plan: dict[str, Any]) -> Path:
     return metadata_path
 
 
+
+def _validate_loader(manifest: Path, *, workers: int = 1) -> dict[str, Any]:
+    """Validate through the inference loader, retaining no decoded audio results.
+
+    With no crops, augmentation, or teacher, __getitem__ only reads immutable
+    records and independently opens each audio file. Threads overlap filesystem
+    reads without transferring tensors or changing training-loader behavior.
+    """
+    workers = _worker_count(workers)
+    started = time.monotonic()
+    dataset = PairedAudioDataset(manifest, RATE_SET, training=False, load_teacher=False)
+    construction_seconds = time.monotonic() - started
+    decode_started = time.monotonic()
+    max_in_flight = 0
+    def validate(index):
+        dataset[index]  # Tensors are discarded inside the reading thread.
+    if workers == 1:
+        for index in range(len(dataset)):
+            validate(index)
+        max_in_flight = min(len(dataset), 1)
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='pair-validation')
+        pending = deque()
+        indices = iter(range(len(dataset)))
+        try:
+            def submit_one():
+                index = next(indices, None)
+                if index is None:
+                    return False
+                pending.append(pool.submit(validate, index))
+                return True
+            for _ in range(min(len(dataset), 2 * workers)):
+                submit_one()
+            max_in_flight = len(pending)
+            while pending:
+                pending.popleft().result()
+                submit_one()
+        finally:
+            # On a bad pair, drain active reads before propagating the failure;
+            # the caller must never publish the pending manifest on an error.
+            pool.shutdown(wait=True, cancel_futures=True)
+    return {'workers': workers, 'executor': 'threads' if workers > 1 else 'in_process',
+            'examples': len(dataset), 'max_in_flight': max_in_flight,
+            'construction_seconds': construction_seconds,
+            'decode_seconds': time.monotonic() - decode_started,
+            'total_seconds': time.monotonic() - started}
+
+
 def _execute_locked(plan: dict[str, Any], module, *, resume: bool, workers: int = 1) -> Path:
     output = Path(plan['output_dir'])
     plan_path = output / 'plan.json'
@@ -774,9 +822,7 @@ def _execute_locked(plan: dict[str, Any], module, *, resume: bool, workers: int 
             handle.write(json.dumps(row) + '\n')
         handle.flush()
         os.fsync(handle.fileno())
-    dataset = PairedAudioDataset(manifest, RATE_SET, training=False, load_teacher=False)
-    for index in range(len(dataset)):
-        dataset[index]  # independent training-loader validation, without training
+    loader_validation = _validate_loader(manifest, workers=workers)
     coverage = {name: sum(name in row['augmentation'] for row in rows)
                 for name in ('clipping', 'bandwidth_limitation', 'codec', 'packet_loss', 'wind_noise')}
     coverage.update(reverberation=sum(row['rir_uid'] != 'none' for row in rows),
@@ -784,6 +830,7 @@ def _execute_locked(plan: dict[str, Any], module, *, resume: bool, workers: int 
     _atomic_json(output / 'provenance.json', {**plan, 'runtime_versions': versions,
         'metadata_sha256': sha256(metadata_path), 'progress_sha256': sha256(output / 'render-progress.jsonl'),
         'manifest_sha256': sha256(manifest), 'realized_degradation_counts': coverage, 'examples': len(rows),
+        'loader_validation': loader_validation,
         'render_execution': {**execution, 'start_method': 'spawn' if workers > 1 else 'in_process',
                              'numeric_threads_per_worker': 1 if workers > 1 else None,
                              'render_and_resume_validation_seconds': render_seconds}})
