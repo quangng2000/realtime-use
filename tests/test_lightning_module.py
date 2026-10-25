@@ -1,6 +1,8 @@
 """Lightning lifecycle tests on small CPU models, without quality claims."""
 
 import copy
+import random
+from types import SimpleNamespace
 
 from lightning.pytorch import Trainer
 import pytest
@@ -171,3 +173,79 @@ def test_kd_requires_target_and_nonfinite_audio_fails(tmp_path):
     invalid["noisy"][0] = float("nan")
     with pytest.raises(FloatingPointError, match="noisy input"):
         trainer(tmp_path, 1).fit(module, train_dataloaders=DataLoader([invalid], batch_size=1))
+
+
+def test_all_future_decoder_parameters_require_grad_before_ddp_wrapping():
+    module = EnhancementModule(tiny_config())
+    assert all(parameter.requires_grad for parameter in module.model.parameters())
+    identities = {id(parameter) for parameter in module.model.parameters()}
+    module.model.activate_prepared_decoders()
+    module._set_active_head_gradients()
+    assert identities == {id(parameter) for parameter in module.model.parameters()}
+    assert all(parameter.requires_grad for parameter in module.model.parameters())
+
+
+def test_validation_excludes_distributed_padding_duplicates(tmp_path):
+    module = EnhancementModule(tiny_config())
+    rows = [TinyDataset()[index] for index in range(3)]
+    for row in rows:
+        row["distributed_valid"] = torch.tensor(True)
+    rows[1]["distributed_valid"] = torch.tensor(False)
+    rows[1]["clean"] = rows[1]["clean"] + 100  # Would dominate an incorrectly included duplicate.
+    expected = []
+    with torch.no_grad():
+        for index in (0, 2):
+            row = rows[index]
+            predictions = module(row["noisy"].unsqueeze(0))
+            expected.append(torch.stack([
+                module.criterion(value, row["clean"].unsqueeze(0), row["lengths"].unsqueeze(0))[0]
+                for value in predictions.values()]).mean())
+    runner = trainer(tmp_path, 2)
+    runner.validate(module, dataloaders=DataLoader(rows, batch_size=2), verbose=False)
+    torch.testing.assert_close(runner.callback_metrics["validation_mean_clean_loss"].float(),
+                               torch.stack(expected).mean())
+    assert module._validation_examples == 2
+
+
+def test_zero_valid_validation_batch_executes_without_scoring_padding(tmp_path):
+    module = EnhancementModule(tiny_config())
+    row = TinyDataset()[0]
+    row["distributed_valid"] = torch.tensor(False)
+    runner = trainer(tmp_path, 2)
+    runner.validate(module, dataloaders=DataLoader([row], batch_size=1), verbose=False)
+    assert module._validation_examples == 0
+    assert all(value == 0 for value in module._validation_totals.values())
+
+
+def test_native_resume_rejects_world_size_change():
+    module = EnhancementModule(tiny_config())
+    checkpoint = module.portable_checkpoint()
+    checkpoint["world_size"] = 2
+    with pytest.raises(ValueError, match="same world size"):
+        module.on_load_checkpoint(checkpoint)
+
+
+def test_cuda_rng_uses_strategy_device_before_transfer_and_after_teardown(monkeypatch):
+    module = EnhancementModule(tiny_config())
+    assigned_device = torch.device("cuda", 1)
+    module._trainer = SimpleNamespace(strategy=SimpleNamespace(root_device=assigned_device),
+                                      world_size=1, global_rank=0)
+    assert module.device.type == "cpu"
+    saved_state = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    called = []
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda device: (called.append(("get", device)) or saved_state))
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda state, device: called.append(("set", device)))
+    checkpoint = {}
+    module.on_save_checkpoint(checkpoint)
+    module.on_load_checkpoint(checkpoint)
+    assert called == [("get", assigned_device), ("set", assigned_device)]
+
+
+def test_local_rng_helpers_preserve_python_and_torch_progression():
+    module = EnhancementModule(tiny_config())
+    saved = module.capture_rng_state()
+    expected_python = [random.randrange(1000) for _ in range(5)]
+    expected_torch = torch.randn(7)
+    module.restore_rng_state(saved)
+    assert [random.randrange(1000) for _ in range(5)] == expected_python
+    torch.testing.assert_close(torch.randn(7), expected_torch, rtol=0, atol=0)

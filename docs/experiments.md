@@ -10,7 +10,7 @@ Before a CUDA run, also verify the optional scan kernel against the reference re
 
 Passing this gate means the tested implementation paths work. It does not demonstrate speech enhancement quality.
 
-Smoke mode uses a one-block, width-4 network even when given a fixed-depth experiment. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. The current Lightning implementation supports one device and rejects distributed operation; DDP and multi-GPU scaling are future work. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
+Smoke mode uses a one-block, width-4 network even when given a fixed-depth experiment. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. CPU/Gloo integration tests exercise DDP gradients, accumulation, sampled exits, decoder transitions, resume, and exact validation weighting. CUDA/NCCL and multi-GPU scaling still need GPU measurements. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
 
 ## 2. Establish a licensed data pilot
 

@@ -153,6 +153,12 @@ def collate_audio(examples: list[dict[str, Any]]) -> dict[str, Any]:
     }
     result["lengths"] = torch.tensor(lengths, dtype=torch.long)
     result["ids"] = [str(item.get("id", index)) for index, item in enumerate(examples)]
+    if any("distributed_valid" in item for item in examples):
+        if not all(isinstance(item.get("distributed_valid"), bool) for item in examples):
+            raise ValueError("a distributed validation batch requires a boolean validity flag on every row")
+        result["distributed_valid"] = torch.tensor(
+            [item["distributed_valid"] for item in examples], dtype=torch.bool,
+        )
     return result
 
 

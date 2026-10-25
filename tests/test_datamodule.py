@@ -1,14 +1,17 @@
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 from lightning import LightningDataModule, seed_everything
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
-from torch.utils.data import RandomSampler, SequentialSampler
+from torch.utils.data import DistributedSampler, RandomSampler, SequentialSampler
 
+from realtime_use.data import SyntheticDataset, collate_audio
 from realtime_use.datamodule import PairedAudioDataModule
+from realtime_use.distributed_data import PaddedValidationSampler, ValidationDataset
 
 
 def configuration(**training):
@@ -61,6 +64,7 @@ def test_strict_paired_setup_preserves_lengths_and_loader_policies(tmp_path):
     validation = next(iter(val_loader))
     assert validation["ids"] == ["val-0", "val-1"]
     assert validation["lengths"].tolist() == [20, 30]
+    assert validation["distributed_valid"].tolist() == [True, True]
 
 
 @pytest.mark.parametrize("stage,kd", [("regression", 0.0), ("adversarial", 1.0)])
@@ -170,3 +174,103 @@ def test_invalid_data_settings_fail_early(section, key, value):
     cfg[section][key] = value
     with pytest.raises(ValueError):
         PairedAudioDataModule(cfg)
+
+
+@pytest.mark.parametrize("count,world_size,batch_size", [
+    (1, 4, 2), (2, 4, 1), (5, 2, 2), (9, 3, 2), (13, 4, 3), (1, 1, 4),
+])
+def test_distributed_validation_counts_each_row_once_with_equal_rank_work(count, world_size, batch_size):
+    cfg = configuration(batch_size=batch_size)
+    cfg["data"]["smoke"] = True
+    original = SyntheticDataset(8000, 80, length=count)
+    valid_ids, rank_shapes, rank_loaders = [], [], []
+    for rank in range(world_size):
+        dm = PairedAudioDataModule(cfg)
+        # setup before attaching a Trainer must not freeze rank=0 into loaders.
+        dm.setup("fit")
+        dm.validation_dataset = original
+        dm.trainer = SimpleNamespace(world_size=world_size, global_rank=rank)
+        loader = dm.val_dataloader()
+        rank_loaders.append(len(loader))
+        shapes = []
+        for batch in loader:
+            assert batch["distributed_valid"].dtype == torch.bool
+            shapes.append(batch["noisy"].shape)
+            valid_ids.extend(identity for identity, valid in zip(batch["ids"], batch["distributed_valid"])
+                             if valid)
+        rank_shapes.append(shapes)
+    assert len(set(rank_loaders)) == 1
+    assert rank_loaders[0] > 0
+    assert all(shapes == rank_shapes[0] for shapes in rank_shapes)
+    assert sorted(valid_ids) == sorted(f"synthetic-{index}" for index in range(count))
+    assert "distributed_valid" not in original[0]
+
+
+@pytest.mark.parametrize("count,world_size,batch_size", [(1, 4, 2), (5, 2, 2), (9, 3, 2)])
+def test_distributed_train_sampler_pads_equal_batches_and_covers_dataset(count, world_size, batch_size):
+    cfg = configuration(batch_size=batch_size)
+    cfg.update(seed=23)
+    cfg["data"]["smoke"] = True
+    index_lists, batch_sizes = [], []
+    for rank in range(world_size):
+        dm = PairedAudioDataModule(cfg)
+        dm.setup("fit")
+        dm.train_dataset = SyntheticDataset(8000, 80, length=count)
+        dm.trainer = SimpleNamespace(world_size=world_size, global_rank=rank)
+        loader = dm.train_dataloader()
+        assert isinstance(loader.sampler, DistributedSampler)
+        assert loader.sampler.seed == 23
+        assert loader.drop_last is False
+        index_lists.append(list(loader.sampler))
+        batch_sizes.append([len(batch["ids"]) for batch in loader])
+    assert set(index for indices in index_lists for index in indices) == set(range(count))
+    assert all(sizes == batch_sizes[0] for sizes in batch_sizes)
+    assert len(batch_sizes[0]) > 0
+
+
+def test_distributed_train_shuffle_changes_by_epoch_and_repeats_from_seed():
+    cfg = configuration()
+    cfg["data"]["smoke"] = True
+    dm = PairedAudioDataModule(cfg)
+    dm.trainer = SimpleNamespace(world_size=2, global_rank=1)
+    sampler = dm.train_dataloader().sampler
+    initial = list(sampler)
+    sampler.set_epoch(1)
+    assert list(sampler) != initial
+    sampler.set_epoch(0)
+    assert list(sampler) == initial
+    assert list(dm.train_dataloader().sampler) == initial
+
+
+def test_distributed_validation_padding_does_not_bias_sample_mean():
+    dataset = SyntheticDataset(8000, 80, length=5)
+    metric_sum, valid_count = 0, 0
+    for rank in range(4):
+        for index, valid in PaddedValidationSampler(dataset, num_replicas=4, rank=rank):
+            metric_sum += index * valid
+            valid_count += valid
+    assert valid_count == 5
+    assert metric_sum / valid_count == 2
+
+
+def test_validation_wrapper_tags_padding_and_collate_preserves_boolean_mask():
+    dataset = ValidationDataset(SyntheticDataset(8000, 80, length=2))
+    valid, padding = dataset[0], dataset[(1, False)]
+    batch = collate_audio([valid, padding])
+    assert batch["distributed_valid"].tolist() == [True, False]
+    assert batch["lengths"].tolist() == [80, 80]
+    for invalid in ({**padding, "distributed_valid": 0}, {key: value for key, value in padding.items()
+                                                           if key != "distributed_valid"}):
+        with pytest.raises(ValueError, match="boolean validity"):
+            collate_audio([valid, invalid])
+
+
+@pytest.mark.parametrize("world_size,rank", [(0, 0), (2, 2), (2, -1), (True, 0), (2, 0.5)])
+def test_validation_sampler_rejects_invalid_rank_context(world_size, rank):
+    with pytest.raises(ValueError):
+        PaddedValidationSampler([1], num_replicas=world_size, rank=rank)
+
+
+def test_validation_sampler_rejects_empty_dataset():
+    with pytest.raises(ValueError, match="at least one"):
+        PaddedValidationSampler([], num_replicas=2, rank=0)

@@ -130,12 +130,15 @@ def test_legacy_weights_initialize_but_cannot_native_resume(tmp_path):
         run_training(cfg)
 
 
-def test_entrypoint_rejects_unvalidated_distributed_and_missing_data(tmp_path):
+def test_entrypoint_accepts_ddp_and_rejects_unsafe_strategy_and_missing_data(tmp_path):
     cfg=config_for(tmp_path)
     cfg.trainer.devices=2
-    with pytest.raises(ValueError,match="one device"):
+    assert prepare_config(cfg)["trainer"]["devices"] == 2
+    cfg.trainer.strategy="ddp_find_unused_parameters_false"
+    with pytest.raises(ValueError,match="unused-parameter"):
         prepare_config(cfg)
     cfg.trainer.devices=1
+    cfg.trainer.strategy="auto"
     with pytest.raises(ValueError,match="train_manifest"):
         run_training(cfg)
 

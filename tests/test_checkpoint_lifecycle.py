@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from realtime_use.infer import enhance_waveform, load_model
-from realtime_use.train import run_training
+from realtime_use.train import TrainingCheckpoints, run_training
 
 
 def tiny_config(output_dir):
@@ -65,5 +65,25 @@ def test_final_validation_checkpoint_retains_native_resume_state(tmp_path, stage
         assert len(resumed["optimizer_states"]) == optimizer_count
         assert any(not torch.equal(saved["model_state"][key], value)
                    for key, value in resumed["model_state"].items())
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+def test_post_fit_validation_preserves_training_rng(tmp_path, monkeypatch):
+    before = {}
+    original = TrainingCheckpoints.on_fit_end
+
+    def capture(callback, trainer, module):
+        original(callback, trainer, module)
+        before.update(module.capture_rng_state())
+
+    monkeypatch.setattr(TrainingCheckpoints, "on_fit_end", capture)
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        path = run_training(tiny_config(tmp_path / "final_validation"))
+        saved = torch.load(path, weights_only=True)["rng_states_by_rank"][0]
+        assert saved["python_rng_state"] == before["python_rng_state"]
+        torch.testing.assert_close(saved["torch_rng_state"], before["torch_rng_state"], rtol=0, atol=0)
     finally:
         torch.set_num_threads(previous_threads)

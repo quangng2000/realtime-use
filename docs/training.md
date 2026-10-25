@@ -49,7 +49,48 @@ python -m realtime_use.train -m \
   trainer.accelerator=gpu trainer.devices=1
 ```
 
-The default Hydra launcher runs these jobs sequentially. A multirun is a set of independent training jobs, not distributed training of one model. Do not override all jobs to share one output directory. The current implementation supports one CPU or one GPU device and rejects distributed execution; DDP and multi-GPU scaling remain future work.
+The default Hydra launcher runs these jobs sequentially. A multirun is a set of independent training jobs, not distributed training of one model. Do not override all jobs to share one output directory. Hydra `-m` is supported for single-device jobs; combining it with DDP is currently rejected because Lightning's child-process re-execution can repeat the sweep.
+
+## Distributed training
+
+Both regression and adversarial stages support PyTorch DDP. Lightning's internal launcher can start one process per GPU:
+
+```bash
+python -m realtime_use.train \
+  experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  trainer.accelerator=gpu trainer.devices=4 trainer.strategy=ddp \
+  training.batch_size=2 training.grad_accum=4 \
+  output_dir=/absolute/path/to/runs/fixed4-ddp
+```
+
+Alternatively, launch the same job with external `torchrun`. Supply one shared, explicit `output_dir` so independently started Hydra processes agree on the run destination:
+
+```bash
+python -m torch.distributed.run --nnodes=1 --nproc_per_node=4 \
+  --master_addr=127.0.0.1 --master_port=29500 \
+  -m realtime_use.train \
+  experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  trainer.accelerator=gpu trainer.devices=4 trainer.strategy=ddp \
+  training.batch_size=2 training.grad_accum=4 \
+  output_dir=/absolute/path/to/runs/fixed4-torchrun
+```
+
+Choose another unused master port when running concurrent local jobs. The explicit IPv4 address also avoids localhost/IPv6 resolver delays on some CPU development hosts.
+
+The generator-update batch size is `world_size × training.batch_size × training.grad_accum` for full microbatches. `training.batch_size` is per rank. Partial batches can reduce the actual number of examples, and the training distributed sampler may repeat a few rows to give ranks equal work. Increasing GPU count does not automatically justify a proportional learning-rate change.
+
+All ranks use the same sampled exit for each training microbatch. Decoder heads are registered before DDP setup, and the shared-to-per-exit transition copies weights without replacing registered parameters. The strategy enables unused-parameter handling and disables static-graph assumptions because active exits and GAN optimizer phases change which parameters receive gradients.
+
+Validation pads rank workloads where necessary but marks padding rows invalid. Global loss is computed from summed valid-example losses and counts, so a complete pass counts every original validation example once, including when the dataset size is not divisible by world size. `training.validation_batches` limits batches **per rank**; a capped pass may cover only a subset. Use a sufficient limit for a full validation-set result.
+
+Checkpoint participation is collective, while checkpoint files and run logs are written by rank zero. Native resume preserves per-rank random states and requires the same world size; changing world size is a fresh initialization experiment, not an exact resume. Keep architecture, optimizer structure, accumulation, and stage compatible with the checkpoint.
+
+For a CPU-only execution check, use `trainer.accelerator=cpu trainer.devices=2 trainer.strategy=ddp` with `smoke=true` and a unique output directory. The smoke model remains tiny. The integration tests also compare actual gradients and Adam moments against an equivalent single-process batch for both regression and GAN; merely completing without a hang would not establish correct gradient reduction.
+
+CUDA/NCCL and multi-node execution have not been exercised by the CPU/Gloo integration tests. Measure GPU memory, mixed-precision behavior, throughput, and scaling separately before a longer run. Launch separate DDP jobs instead of a distributed Hydra multirun.
 
 ## Update counts and accumulation
 
@@ -126,4 +167,4 @@ Inference, evaluation, export, and benchmark commands retain their existing flag
 
 `smoke=true` substitutes a one-block, width-4 model and tiny generated data. It caps the generator-update budget at three; set `training.steps=1` or `training.steps=2` for a shorter check. Synthetic validation checks the execution path; it is not a speech-quality result. A sweep of smoke jobs tests configuration and lifecycle handling, not the actual 4-/8-/12-block training cost.
 
-CPU tests do not validate CUDA kernels, GPU precision modes, full-size training memory, distributed execution, or production latency. Measure those independently before allocating a longer run.
+CPU/Gloo tests do not validate CUDA kernels, NCCL, GPU precision modes, full-size training memory, multi-node execution, or production latency. Measure those independently before allocating a longer run.

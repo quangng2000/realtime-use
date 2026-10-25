@@ -35,7 +35,7 @@ python -m pip install -e '.[cuda]'
 
 Pass `model.scan_backend=mamba_ssm` to require the CUDA scan kernel and fail clearly if it is unavailable. The supplied `auto` setting can fall back to the much slower reference implementation. Initial verification is CPU-only: CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
 
-The current implementation supports one CPU or one GPU device and rejects distributed execution. Lightning integration does not establish multi-GPU scaling or DDP correctness.
+The trainer supports one device or PyTorch DDP for regression and adversarial training. The integration suite exercises two CPU/Gloo processes, gradient accumulation, decoder transitions, checkpoint resume, and comparison with an equivalent single-process batch. CUDA/NCCL correctness, memory use, and scaling still require GPU validation.
 
 ## Prepare your data
 
@@ -94,6 +94,24 @@ python -m realtime_use.train -m \
 ```
 
 Use isolated output directories for each job. A sweep starts multiple training runs; it does not split one model across GPUs. See [training configuration and migration](docs/training.md) for overrides, checkpoints, and update-count semantics.
+
+## Train on several GPUs
+
+For one four-GPU DDP job, use an explicit shared output directory:
+
+```bash
+python -m realtime_use.train \
+  experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  trainer.accelerator=gpu trainer.devices=4 trainer.strategy=ddp \
+  training.batch_size=2 training.grad_accum=4 \
+  output_dir=/absolute/path/to/runs/fixed4-ddp
+```
+
+Batch size is per rank: this example accumulates **4 ranks × 2 examples × 4 microbatches = 32 examples per generator update** when all microbatches are full. The same DDP settings apply to adversarial fine-tuning with `training.stage=adversarial` and `init_from` pointing to a regression checkpoint.
+
+Hydra `-m` with a distributed job is currently rejected; launch each DDP experiment separately. External `torchrun`, validation sharding, and resume requirements are documented in [training.md](docs/training.md#distributed-training).
 
 The regression loss combines waveform L1 with multi-resolution spectral convergence and log-magnitude losses. These are independently chosen objectives. Their definitions live in `src/realtime_use/losses.py`; they should not be described as a verified copy of the papers' loss implementation.
 

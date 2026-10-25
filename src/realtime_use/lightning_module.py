@@ -12,8 +12,11 @@ import random
 from typing import Any
 
 from lightning.pytorch import LightningModule
+from lightning.pytorch.strategies import DDPStrategy
 import torch
 from torch import Tensor
+from torch import distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from .config import ModelConfig
 from .discriminators import MultiScaleDiscriminator
@@ -22,8 +25,20 @@ from .model import Enhancer
 
 
 def _finite(value: Tensor, name: str) -> None:
-    if not torch.isfinite(value).all():
+    finite = torch.isfinite(value).all().to(dtype=torch.int32)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not bool(finite):
         raise FloatingPointError(f"Nonfinite {name}; update aborted. Inspect data or use full precision.")
+
+
+def _finite_gradients(gradients: list[Tensor], device: torch.device, name: str) -> None:
+    finite = (torch.stack([torch.isfinite(gradient).all() for gradient in gradients]).all()
+              if gradients else torch.zeros((), dtype=torch.bool, device=device)).to(torch.int32)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    if not bool(finite):
+        raise FloatingPointError(f"Missing or nonfinite {name}; update aborted on every rank")
 
 
 class EnhancementModule(LightningModule):
@@ -77,11 +92,14 @@ class EnhancementModule(LightningModule):
         self._generator_optimizer: torch.optim.Optimizer | None = None
         self._validation_totals: dict[str, Tensor] = {}
         self._validation_examples = 0
+        self.last_exit_depths: tuple[int, ...] = ()
 
     def _set_active_head_gradients(self) -> None:
-        shared = self.model.config.decoder_mode == "shared"
-        self.model.shared_decoder.requires_grad_(shared)
-        self.model.decoders.requires_grad_(not shared)
+        # DDP installs reducer hooks only on parameters requiring gradients at
+        # wrapper construction. Keep future heads registered and trainable;
+        # find_unused_parameters handles the heads absent from the current graph.
+        self.model.shared_decoder.requires_grad_(True)
+        self.model.decoders.requires_grad_(True)
 
     def forward(self, waveform: Tensor, exit_depths=None) -> dict[int, Tensor]:
         return self.model.enhance(waveform, exit_depths=exit_depths)
@@ -107,7 +125,11 @@ class EnhancementModule(LightningModule):
 
     def on_fit_start(self) -> None:
         if self.trainer.world_size != 1:
-            raise RuntimeError("Multi-device/DDP training is not validated; use one CPU or one GPU per run")
+            wrapped = self.trainer.strategy.model
+            if (not isinstance(self.trainer.strategy, DDPStrategy)
+                    or not isinstance(wrapped, DistributedDataParallel)
+                    or not wrapped.find_unused_parameters or wrapped.static_graph):
+                raise RuntimeError("Multi-device training requires DDP with find_unused_parameters=True and static_graph=False")
         if self.trainer.accumulate_grad_batches != 1:
             raise ValueError("Set Trainer.accumulate_grad_batches=1; training.grad_accum controls manual accumulation")
         self._set_active_head_gradients()
@@ -129,6 +151,20 @@ class EnhancementModule(LightningModule):
             return optimizers, None
         return optimizers[0], optimizers[1]
 
+    def _select_exit_depths(self) -> list[int]:
+        if self.training_config.get("sample_exit", True):
+            distributed = dist.is_available() and dist.is_initialized()
+            rank = dist.get_rank() if distributed else 0
+            selected = random.choice(self.model.config.exits) if rank == 0 else 0
+            choice = torch.tensor(selected, device=self.device, dtype=torch.long)
+            if distributed:
+                dist.broadcast(choice, src=0)
+            result = [int(choice)]
+        else:
+            result = list(self.model.config.exits)
+        self.last_exit_depths = tuple(result)
+        return result
+
     def training_step(self, batch: dict[str, Any], batch_idx: int):
         generator_optimizer, discriminator_optimizer = self._optimizers()
         if self.microbatches_in_update == 0:
@@ -140,8 +176,7 @@ class EnhancementModule(LightningModule):
         noisy, clean, lengths = batch["noisy"], batch["clean"], batch.get("lengths")
         _finite(noisy, "noisy input")
         _finite(clean, "clean input")
-        exits = ([random.choice(self.model.config.exits)] if self.training_config.get("sample_exit", True)
-                 else list(self.model.config.exits))
+        exits = self._select_exit_depths()
         predictions = self(noisy, exit_depths=exits)
         reconstruction, metrics = [], {}
         for prediction in predictions.values():
@@ -190,9 +225,8 @@ class EnhancementModule(LightningModule):
         self.microbatches_in_update += 1
         if self.microbatches_in_update == self.accumulation:
             # Catch invalid accumulated gradients before either GAN optimizer can update.
-            for parameter in self.parameters():
-                if parameter.grad is not None:
-                    _finite(parameter.grad, "accumulated gradient")
+            _finite_gradients([parameter.grad for parameter in self.parameters() if parameter.grad is not None],
+                              self.device, "accumulated gradients")
             if discriminator_optimizer is not None:
                 scaler = getattr(self.trainer.precision_plugin, "scaler", None)
                 old_scale = scaler.get_scale() if scaler is not None else None
@@ -208,44 +242,63 @@ class EnhancementModule(LightningModule):
             self.completed_updates.add_(1)
             self.microbatches_in_update = 0
             self.log_dict(self._update_metrics, on_step=True, on_epoch=False,
-                          batch_size=len(noisy), logger=self.logger is not None)
+                          batch_size=len(noisy), logger=self.logger is not None,
+                          sync_dist=self.trainer.world_size > 1)
             self.log("completed_updates", self.completed_updates.float(), on_step=True, on_epoch=False,
-                     batch_size=len(noisy), logger=self.logger is not None)
+                     batch_size=len(noisy), logger=self.logger is not None,
+                     sync_dist=self.trainer.world_size > 1)
         return generator_loss.detach()
 
     def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
         # Lightning invokes this after AMP unscaling and before the optimizer update.
         gradients = [parameter.grad for group in optimizer.param_groups for parameter in group["params"]
                      if parameter.grad is not None]
-        if not gradients:
-            raise RuntimeError("No gradients reached the optimizer")
-        for gradient in gradients:
-            _finite(gradient, "unscaled gradient")
+        _finite_gradients(gradients, self.device, "unscaled gradients")
         self.clip_gradients(optimizer, gradient_clip_val=self.clip_norm, gradient_clip_algorithm="norm")
-        for gradient in gradients:
-            _finite(gradient, "clipped gradient")
+        _finite_gradients(gradients, self.device, "clipped gradients")
 
     def on_validation_epoch_start(self) -> None:
         if self.microbatches_in_update:
             raise RuntimeError("Validate only between optimizer updates; align validation interval with grad_accum")
-        self._validation_totals = {}
+        self._validation_totals = {f"validation_clean_loss_exit_{depth}":
+                                   torch.zeros((), dtype=torch.float64, device=self.device)
+                                   for depth in self.model.config.exits}
         self._validation_examples = 0
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:
+        # Equal-sized padded batches execute on every rank. Padding duplicates
+        # participate in forward calls but never in validation numerators/counts.
         predictions = self(batch["noisy"])
+        valid = batch.get("distributed_valid")
+        valid = (torch.ones(len(batch["noisy"]), dtype=torch.bool, device=self.device)
+                 if valid is None else valid.to(device=self.device, dtype=torch.bool))
+        if valid.ndim != 1 or len(valid) != len(batch["noisy"]):
+            raise ValueError("distributed_valid must contain one boolean per validation utterance")
+        count = int(valid.sum())
+        lengths = batch.get("lengths")
+        lengths = lengths.to(self.device)[valid] if lengths is not None else None
         for depth, prediction in predictions.items():
-            loss, _ = self.criterion(prediction, batch["clean"], lengths=batch.get("lengths"))
+            loss = prediction.new_zeros(())
+            if count:
+                loss, _ = self.criterion(prediction[valid], batch["clean"][valid], lengths=lengths)
+            # All ranks call the finite check even when this rank has zero originals.
             _finite(loss, "validation loss")
             key = f"validation_clean_loss_exit_{depth}"
-            self._validation_totals[key] = self._validation_totals.get(key, 0.0) + loss.detach() * len(prediction)
-        self._validation_examples += len(batch["noisy"])
+            self._validation_totals[key] += loss.detach().double() * count
+        self._validation_examples += count
 
     def on_validation_epoch_end(self) -> None:
-        if not self._validation_examples:
+        names = list(self._validation_totals)
+        values = torch.stack([torch.tensor(self._validation_examples, dtype=torch.float64, device=self.device),
+                              *[self._validation_totals[name] for name in names]])
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        if not bool(values[0]):
             return
-        metrics = {key: value / self._validation_examples for key, value in self._validation_totals.items()}
+        metrics = {name: values[index + 1] / values[0] for index, name in enumerate(names)}
         metrics["validation_mean_clean_loss"] = torch.stack(list(metrics.values())).mean()
-        self.log_dict(metrics, on_step=False, on_epoch=True, logger=self.logger is not None)
+        # Values are already global sum/count means, including unequal valid counts.
+        self.log_dict(metrics, on_step=False, on_epoch=True, logger=self.logger is not None, sync_dist=False)
 
     def _portable_model_state(self) -> dict[str, Tensor]:
         inactive = "decoders." if self.model.config.decoder_mode == "shared" else "shared_decoder."
@@ -275,14 +328,48 @@ class EnhancementModule(LightningModule):
         self.model.load_state_dict(combined, strict=True)
         self._set_active_head_gradients()
 
+    def _rng_device(self) -> torch.device:
+        # Lightning restores before moving the module to its device and invokes
+        # on_fit_end after moving it back to CPU. The strategy retains the rank's
+        # assigned accelerator throughout both lifecycle points.
+        return self.trainer.strategy.root_device if self._trainer is not None else self.device
+
+    def capture_rng_state(self) -> dict[str, Any]:
+        """Capture this rank's Python and PyTorch RNGs without a collective."""
+        state = {"python_rng_state": random.getstate(), "torch_rng_state": torch.get_rng_state()}
+        rng_device = self._rng_device()
+        if rng_device.type == "cuda":
+            state["cuda_rng_state"] = torch.cuda.get_rng_state(rng_device)
+        return state
+
+    def restore_rng_state(self, state: dict[str, Any]) -> None:
+        """Restore local RNGs, including around a separate Trainer.validate call."""
+        if "python_rng_state" in state:
+            random.setstate(state["python_rng_state"])
+        if "torch_rng_state" in state:
+            torch.set_rng_state(state["torch_rng_state"].cpu())
+        rng_device = self._rng_device()
+        if rng_device.type == "cuda" and "cuda_rng_state" in state:
+            torch.cuda.set_rng_state(state["cuda_rng_state"].cpu(), rng_device)
+        elif torch.cuda.is_available() and "cuda_rng_states" in state:
+            if len(state["cuda_rng_states"]) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda_rng_states"]])
+
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         if self.microbatches_in_update:
             raise RuntimeError("Checkpoint only at completed updates; partial accumulated gradients are not saved")
         checkpoint.update(self.portable_checkpoint())
-        checkpoint["python_rng_state"] = random.getstate()
-        checkpoint["torch_rng_state"] = torch.get_rng_state()
-        if torch.cuda.is_available():
-            checkpoint["cuda_rng_states"] = torch.cuda.get_rng_state_all()
+        local_rng = self.capture_rng_state()
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        rank_states: list[Any] = [None] * world_size
+        if world_size > 1:
+            # Trainer.save_checkpoint must be called by every rank; its strategy
+            # restricts actual filesystem writes to global rank zero.
+            dist.all_gather_object(rank_states, local_rng)
+        else:
+            rank_states[0] = local_rng
+        checkpoint["rng_states_by_rank"] = rank_states
+        checkpoint["world_size"] = world_size
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         if checkpoint.get("stage") != self.stage:
@@ -290,10 +377,10 @@ class EnhancementModule(LightningModule):
         self.model.config.decoder_mode = checkpoint["model_config"]["decoder_mode"]
         self._set_active_head_gradients()
         self.microbatches_in_update = 0
-        if "python_rng_state" in checkpoint:
-            random.setstate(checkpoint["python_rng_state"])
-        if "torch_rng_state" in checkpoint:
-            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
-        if torch.cuda.is_available() and "cuda_rng_states" in checkpoint:
-            if len(checkpoint["cuda_rng_states"]) == torch.cuda.device_count():
-                torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_states"]])
+        world_size = self.trainer.world_size if self._trainer is not None else 1
+        if int(checkpoint.get("world_size", 1)) != world_size:
+            raise ValueError("Native resume requires the same world size; use init_from for a fresh run at a different world size")
+        rank = self.trainer.global_rank if self._trainer is not None else 0
+        states = checkpoint.get("rng_states_by_rank")
+        local_rng = states[rank] if states is not None else checkpoint
+        self.restore_rng_state(local_rng)

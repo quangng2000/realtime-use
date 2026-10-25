@@ -2,7 +2,9 @@
 
 The entrypoint must call ``lightning.seed_everything(seed, workers=True)`` once
 before constructing the model and data module. Lightning then initializes worker
-seeds and distributed samplers. Native checkpoint resume restores training state,
+seeds and advances the training sampler epoch. Use ``use_distributed_sampler=False``
+on the Trainer: this module owns both training and validation sharding. Native
+checkpoint resume restores training state,
 but this module does not claim exact mid-epoch data order or crop replay.
 """
 
@@ -13,10 +15,11 @@ import math
 from typing import Any
 
 from lightning import LightningDataModule
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 from .config import ModelConfig
 from .data import PairedAudioDataset, SyntheticDataset, collate_audio
+from .distributed_data import PaddedValidationSampler, ValidationDataset
 
 
 class PairedAudioDataModule(LightningDataModule):
@@ -35,6 +38,7 @@ class PairedAudioDataModule(LightningDataModule):
         data = self.config.get("data", {})
         loss = self.config.get("loss", {})
         self.sample_rate = model.sample_rate
+        self.seed = int(self.config.get("seed", 0))
         self.batch_size = training.get("batch_size", 4)
         self.workers = training.get("workers", 0)
         for name, value, minimum in (("batch_size", self.batch_size, 1), ("workers", self.workers, 0)):
@@ -101,13 +105,31 @@ class PairedAudioDataModule(LightningDataModule):
                 )
             )
 
+    def _distributed_context(self) -> tuple[int, int]:
+        # setup() can run before attaching the Trainer. Resolve ranks only when
+        # it requests loaders, after the distributed strategy is initialized.
+        trainer = self.trainer
+        return (int(trainer.world_size), int(trainer.global_rank)) if trainer is not None else (1, 0)
+
     def _loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
+        world_size, rank = self._distributed_context()
+        sampler = None
+        if not shuffle:
+            dataset = ValidationDataset(dataset)
+        if world_size > 1:
+            sampler = (
+                DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                   shuffle=True, seed=self.seed, drop_last=False)
+                if shuffle else PaddedValidationSampler(dataset, num_replicas=world_size, rank=rank)
+            )
         # Leave worker_init_fn to Lightning's seed_everything(workers=True)
-        # integration and leave distributed sampler replacement to the Trainer.
+        # integration. Lightning calls set_epoch on our training sampler even
+        # with automatic distributed sampler replacement disabled.
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
-            shuffle=shuffle,
+            shuffle=shuffle and sampler is None,
+            sampler=sampler,
             num_workers=self.workers,
             collate_fn=collate_audio,
             pin_memory=self.pin_memory,
