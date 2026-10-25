@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "realtime-use"
-version = "0.1.0"
+version = "0.2.0"
 description = "Independent causal speech enhancement training baselines"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,7 +13,12 @@ dependencies = [
   "numpy>=1.26,<3",
   "PyYAML>=6,<7",
   "soundfile>=0.12,<1",
+  "lightning>=2.5,<3",
+  "hydra-core>=1.3.2,<1.4",
 ]
+
+[project.scripts]
+realtime-use-train = "realtime_use.train:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
@@ -21,6 +26,9 @@ cuda = ["mamba-ssm>=2.2,<3", "causal-conv1d>=1.4,<2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+realtime_use = ["conf/*.yaml", "conf/*/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

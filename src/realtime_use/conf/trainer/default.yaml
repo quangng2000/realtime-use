@@ -1,0 +1,8 @@
+accelerator: cpu
+devices: 1
+strategy: auto
+precision: 32-true
+deterministic: false
+enable_progress_bar: true
+enable_model_summary: false
+num_sanity_val_steps: 0

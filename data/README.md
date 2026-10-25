@@ -4,6 +4,17 @@ Supply your own permitted, aligned pairs. The repository does not download train
 
 ## Manifest format
 
+Pass manifests through Hydra when training:
+
+```bash
+python -m realtime_use.train experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  trainer.accelerator=cpu trainer.devices=1
+```
+
+These paths select user-provided files; they do not trigger downloads. Absolute manifest paths avoid ambiguity when running sweeps. Audio paths within each manifest are still resolved relative to that manifest.
+
 Use one JSON object per line in a UTF-8 JSONL file:
 
 ```json
@@ -44,4 +55,4 @@ Local audio, generated teacher outputs, and training artifacts should remain out
 
 ## Smoke data
 
-The trainer's `--smoke` option generates tiny deterministic tones/noise locally and substitutes a one-block, width-4 model. It needs no manifest or external data. It exists to exercise software behavior, not to create a useful pretrained speech model or measure the supplied full-size configurations.
+The training override `smoke=true` generates tiny deterministic tones/noise locally and substitutes a one-block, width-4 model. It needs no manifest or external data. It exists to exercise software behavior, not to create a useful pretrained speech model or measure the supplied full-size configurations.

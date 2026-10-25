@@ -10,7 +10,7 @@ Before a CUDA run, also verify the optional scan kernel against the reference re
 
 Passing this gate means the tested implementation paths work. It does not demonstrate speech enhancement quality.
 
-Smoke mode uses a one-block, width-4 network even when given a fixed-depth config. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. The current trainer is single-device; multi-GPU scaling is future work. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
+Smoke mode uses a one-block, width-4 network even when given a fixed-depth experiment. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. The current Lightning implementation supports one device and rejects distributed operation; DDP and multi-GPU scaling are future work. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
 
 ## 2. Establish a licensed data pilot
 
@@ -28,13 +28,13 @@ Train the fixed four-block regression model first. Inspect clean-input behavior,
 
 ## 3. Compare fixed depths
 
-Run fixed 4-, 8-, and 12-block models with the same data split and preprocessing. Record the comparison basis: equal optimizer steps, equal audio exposure, or equal compute budget. These answer different questions.
+Run fixed 4-, 8-, and 12-block models with the same data split and preprocessing. Record the comparison basis: equal generator updates, equal audio exposure, or equal compute budget. These answer different questions. A Hydra multirun can schedule the experiment configurations; it is not distributed training of one model.
 
 For each run, retain:
 
 - Repository revision, full config, random seed, checkpoint identifier, and data manifest/version.
 - Trainable and per-exit active parameter counts measured from the model.
-- Training sample rate, crop length, batch size, gradient accumulation, precision, optimizer, stage, and step count.
+- Training sample rate, crop length, batch size, gradient accumulation, precision, optimizer, stage, and generator-update count. In the adversarial stage, Lightning's optimizer-step counter includes both optimizers; do not equate it with generator updates.
 - GPU model/count, peak memory, measured optimizer-step time, wall-clock time, and validation/checkpoint overhead.
 - Held-out waveform/spectral metrics, listening notes, and any separately installed speech-quality or ASR metrics with their versions and evaluation settings.
 
@@ -64,12 +64,12 @@ Report algorithmic latency, processing latency, and device/transport buffering s
 
 ## 7. Scale only after measuring throughput
 
-Measure several hundred representative optimizer steps after warm-up. Include the intended data loader, augmentation, crop duration, sample rate, precision, and stage. Adversarial training needs its own measurement; it adds discriminator and feature-matching work.
+Measure several hundred representative generator updates after warm-up. Include the intended data loader, augmentation, crop duration, sample rate, precision, and stage. Adversarial training needs its own measurement; each generator update includes discriminator and feature-matching work.
 
 Estimate elapsed training time as:
 
 ```text
-planned optimizer steps × measured seconds per optimizer step
+planned generator updates × measured seconds per generator update
 + validation + checkpointing + data preparation + scheduling overhead
 ```
 

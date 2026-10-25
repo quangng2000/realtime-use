@@ -1,6 +1,6 @@
 # Notice
 
-This is an independently developed research implementation in the private `quangng2000/realtime-use` repository. No public software license has been selected; this repository does not grant a public license to redistribute its code or future model artifacts.
+This is an independently developed research implementation in the public `quangng2000/realtime-use` repository. No public software license has been selected; public visibility does not grant a license to redistribute its code or future model artifacts.
 
 The project cites research by the authors of [One Model, Many Latencies](https://arxiv.org/abs/2606.25621) and [Rethinking Training Targets, Architectures and Data Quality](https://arxiv.org/abs/2603.02641). Citation does not imply affiliation, endorsement, an exact reproduction, or matching experimental results.
 

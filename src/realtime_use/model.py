@@ -114,7 +114,9 @@ class Enhancer(nn.Module):
         return tuple(sorted(result))
 
     def _decoder(self, exit_depth: int) -> SpectralDecoder:
-        if self.shared_decoder is not None:
+        if self.config.decoder_mode == "shared":
+            if self.shared_decoder is None:
+                raise RuntimeError("Shared decoder is not initialized")
             return self.shared_decoder
         return self.decoders[str(exit_depth)]
 
@@ -140,10 +142,29 @@ class Enhancer(nn.Module):
         return {depth: self.transform.synthesis(value, waveform.shape[-1]) for depth, value in self(spectrum, exit_depths).items()}
 
     def split_decoders(self) -> None:
-        if self.shared_decoder is None:
+        if self.config.decoder_mode == "per_exit":
             return
         self.decoders.update({str(depth): copy.deepcopy(self.shared_decoder) for depth in self.config.exits})
         self.shared_decoder = None
+        self.config.decoder_mode = "per_exit"
+
+    def prepare_decoder_transition(self) -> None:
+        """Register both head layouts before a training strategy sets up parameters."""
+        if self.shared_decoder is None:
+            self.shared_decoder = SpectralDecoder(self.config.width)
+        for depth in self.config.exits:
+            if str(depth) not in self.decoders:
+                self.decoders[str(depth)] = copy.deepcopy(self.shared_decoder)
+
+    def activate_prepared_decoders(self) -> None:
+        """Copy the trained shared head without replacing any registered parameters."""
+        if self.config.decoder_mode == "per_exit":
+            return
+        if self.shared_decoder is None or any(str(depth) not in self.decoders for depth in self.config.exits):
+            raise RuntimeError("Call prepare_decoder_transition before optimizer construction")
+        state = self.shared_decoder.state_dict()
+        for decoder in self.decoders.values():
+            decoder.load_state_dict(state, strict=True)
         self.config.decoder_mode = "per_exit"
 
     def step(self, frame: Tensor, state: dict | None = None, exit_depth: int | None = None) -> tuple[Tensor, dict]:

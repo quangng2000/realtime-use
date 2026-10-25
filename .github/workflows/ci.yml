@@ -32,5 +32,5 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e '.[test]'
-      - name: Run reference-backend tests
+      - name: Run reference-backend and Lightning tests
         run: python -m pytest -q

@@ -1,0 +1,7 @@
+waveform: 1.0
+stft: 1.0
+kd: 0.0
+fft_sizes:
+- 256
+- 512
+- 1024

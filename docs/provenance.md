@@ -4,7 +4,7 @@ This ledger separates research references, project code, dependencies, training 
 
 ## Current project boundary
 
-- **Project code:** independently implemented for the private `quangng2000/realtime-use` repository. No public software license has been selected. See [NOTICE.md](../NOTICE.md).
+- **Project code:** independently implemented for the public [quangng2000/realtime-use](https://github.com/quangng2000/realtime-use) repository. Public visibility does not select a software license; no public software license has been selected. See [NOTICE.md](../NOTICE.md).
 - **NVIDIA model source and checkpoints:** none included or automatically downloaded. In particular, restricted source and tensors from the original `nvidia/RE-USE` and `nvidia/Real-time_RE-USE` releases are not implementation dependencies.
 - **Training audio:** none supplied as a production dataset. Synthetic smoke audio is generated locally for software tests and is not evidence of speech performance.
 - **Teacher outputs:** none supplied. Distillation is disabled by default.
@@ -45,4 +45,4 @@ Cached teacher outputs need a link to that record and to the source-audio permis
 
 ## Required record before distributing trained weights
 
-Identify the training run, source revision, configuration, complete materials ledger, dependency versions, evaluation evidence, known limitations, and the license actually selected by the owner. A private repository, independent implementation, or a successful test suite alone does not settle rights to training data or trained artifacts.
+Identify the training run, source revision, configuration, complete materials ledger, dependency versions, evaluation evidence, known limitations, and the license actually selected by the owner. Repository visibility, independent implementation, or a successful test suite alone does not settle rights to training data or trained artifacts.

@@ -1,23 +1,11 @@
-"""Exercise optimizer transitions, loss gradients, and real checkpoint continuation."""
+"""Numerical training objectives independent of the Lightning orchestration."""
 
-import json
-from pathlib import Path
-
-import numpy as np
 import pytest
-import soundfile as sf
 import torch
-import yaml
-
-from realtime_use.config import ModelConfig
 from realtime_use.discriminators import MultiScaleDiscriminator
 from realtime_use.losses import (ReconstructionLoss, discriminator_audio_loss,
-                                 discriminator_hinge_loss, feature_matching_loss,
-                                 generator_audio_losses, generator_hinge_loss)
-from realtime_use.model import Enhancer
-from realtime_use.train import (build_optimizer, make_parser, run_training,
-                                transition_decoders)
-
+    discriminator_hinge_loss, feature_matching_loss, generator_audio_losses,
+    generator_hinge_loss)
 
 @pytest.fixture(autouse=True)
 def single_thread():
@@ -25,14 +13,6 @@ def single_thread():
     torch.set_num_threads(1)
     yield
     torch.set_num_threads(previous)
-
-
-def tiny_model_config(**overrides):
-    values = dict(sample_rate=800, window_ms=40.0, hop_ms=20.0,
-                  depth=2, exits=(1, 2), width=4, state_dim=2,
-                  expand=1, conv_kernel=2, scan_backend="reference")
-    values.update(overrides)
-    return ModelConfig(**values)
 
 
 def test_reconstruction_loss_is_finite_and_backpropagates_for_short_audio():
@@ -109,122 +89,3 @@ def test_adversarial_objectives_ignore_padding_and_match_per_utterance_losses():
     (padded_adversarial + padded_matching).backward()
     for index, length in enumerate(lengths):
         assert torch.count_nonzero(prediction.grad[index, length:]) == 0
-
-
-def test_split_decoders_preserves_outputs_and_backbone_optimizer_moments():
-    model = Enhancer(tiny_model_config())
-    training = {"lr": 2e-4, "predecoder_lr_scale": 0.1}
-    optimizer = build_optimizer(model, training)
-    spectrum = torch.randn(1, 3, 17, dtype=torch.complex64)
-    sum(value.abs().mean() for value in model(spectrum).values()).backward()
-    optimizer.step()
-    before = {depth: value.detach().clone() for depth, value in model(spectrum).items()}
-    backbone_parameter = next(model.encoder.parameters())
-    moments = optimizer.state[backbone_parameter]["exp_avg"].clone()
-    optimizer = transition_decoders(model, optimizer, training)
-    assert model.config.decoder_mode == "per_exit"
-    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx([2e-5, 2e-4])
-    torch.testing.assert_close(optimizer.state[backbone_parameter]["exp_avg"], moments)
-    for depth, value in model(spectrum).items():
-        torch.testing.assert_close(value, before[depth])
-    assert model.decoders["1"].output.weight is not model.decoders["2"].output.weight
-
-
-def make_training_files(tmp_path: Path, kd: float = 0.0, teacher: bool = False):
-    cfg = {"model": tiny_model_config(depth=1, exits=(1,)).to_dict(),
-           "training": {"batch_size": 1, "crop_seconds": 0.16, "steps": 1,
-                        "precision": "fp32", "lr": 1e-3, "checkpoint_every": 1,
-                        "log_every": 1, "validation_batches": 1, "grad_accum": 2},
-           "loss": {"waveform": 1.0, "stft": 0.1, "fft_sizes": [16, 32], "kd": kd},
-           "adversarial": {"channels": 4, "scales": 1, "weight": 0.01,
-                           "feature_matching": 0.1}}
-    config = tmp_path / "train.yaml"
-    config.write_text(yaml.safe_dump(cfg))
-    x = np.arange(128, dtype=np.float32) / 800
-    clean = 0.2 * np.sin(2 * np.pi * 120 * x)
-    noisy = clean + 0.02 * np.random.default_rng(0).normal(size=128).astype(np.float32)
-    sf.write(tmp_path / "clean.wav", clean, 800, subtype="FLOAT")
-    sf.write(tmp_path / "noisy.wav", noisy, 800, subtype="FLOAT")
-    row = {"noisy": "noisy.wav", "clean": "clean.wav", "sample_rate": 800}
-    if teacher:
-        row["teacher"] = "clean.wav"
-    manifest = tmp_path / "manifest.jsonl"
-    manifest.write_text(json.dumps(row) + "\n")
-    return config, manifest
-
-
-def test_training_checkpoint_kd_validation_and_teacher_free_adversarial_resume(tmp_path):
-    config, manifest = make_training_files(tmp_path, kd=0.5, teacher=True)
-    parser = make_parser()
-    regression = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest),
-        "--validation-manifest", str(manifest), "--output", str(tmp_path / "regression"),
-    ]))
-    initial = torch.load(regression, weights_only=True)
-    assert initial["stage"] == "regression" and initial["step"] == 1
-    assert (regression.parent / "best.pt").is_file()
-    metrics = json.loads((regression.parent / "metrics.jsonl").read_text().splitlines()[-1])
-    assert metrics["kd_loss"] >= 0
-    assert "validation_mean_clean_loss" in metrics
-    # Deliberately leave loss.kd enabled but remove cached targets: stage two must ignore KD.
-    row = json.loads(manifest.read_text())
-    row.pop("teacher")
-    manifest.write_text(json.dumps(row) + "\n")
-    adversarial = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest),
-        "--output", str(tmp_path / "adversarial"), "--stage", "adversarial",
-        "--init-from", str(regression),
-    ]))
-    state = torch.load(adversarial, weights_only=True)
-    assert state["stage"] == "adversarial" and state["step"] == 1
-    assert state["discriminator_optimizer_state"]["state"]
-    assert any(not torch.equal(value, initial["model_state"][key])
-               for key, value in state["model_state"].items())
-    resumed = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest),
-        "--output", str(tmp_path / "continued"), "--stage", "adversarial",
-        "--resume", str(adversarial), "--steps", "2",
-    ]))
-    assert torch.load(resumed, weights_only=True)["step"] == 2
-
-
-def test_kd_requires_cached_targets_and_stage_two_requires_initialization(tmp_path):
-    config, manifest = make_training_files(tmp_path, kd=1)
-    parser = make_parser()
-    base = ["--config", str(config), "--manifest", str(manifest), "--output", str(tmp_path / "failed")]
-    with pytest.raises(ValueError, match="cached teacher"):
-        run_training(parser.parse_args(base))
-    with pytest.raises(ValueError, match="requires --init-from"):
-        run_training(parser.parse_args(base + ["--stage", "adversarial"]))
-
-
-def test_resume_rejects_stage_change(tmp_path):
-    config, manifest = make_training_files(tmp_path)
-    parser = make_parser()
-    checkpoint = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest), "--output", str(tmp_path / "first")]))
-    with pytest.raises(ValueError, match="preserve stage"):
-        run_training(parser.parse_args([
-            "--config", str(config), "--manifest", str(manifest), "--output", str(tmp_path / "bad"),
-            "--resume", str(checkpoint), "--stage", "adversarial", "--steps", "2"]))
-
-
-def test_resume_after_decoder_transition_restores_per_exit_architecture(tmp_path):
-    config, manifest = make_training_files(tmp_path)
-    settings = yaml.safe_load(config.read_text())
-    settings["model"] = tiny_model_config().to_dict()
-    settings["training"].update(steps=2, split_decoders_at=1, grad_accum=1)
-    config.write_text(yaml.safe_dump(settings))
-    parser = make_parser()
-    checkpoint = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest), "--output", str(tmp_path / "split")]))
-    saved = torch.load(checkpoint, weights_only=True)
-    assert saved["model_config"]["decoder_mode"] == "per_exit"
-    assert saved["training_config"]["model"]["decoder_mode"] == "per_exit"
-    assert len(saved["optimizer_state"]["param_groups"]) == 2
-    resumed = run_training(parser.parse_args([
-        "--config", str(config), "--manifest", str(manifest), "--output", str(tmp_path / "split_resume"),
-        "--resume", str(checkpoint), "--steps", "3"]))
-    saved = torch.load(resumed, weights_only=True)
-    assert saved["step"] == 3
-    assert saved["model_config"]["decoder_mode"] == "per_exit"

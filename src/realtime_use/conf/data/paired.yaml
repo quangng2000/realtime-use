@@ -1,0 +1,4 @@
+train_manifest: null
+validation_manifest: null
+pin_memory: false
+smoke: false

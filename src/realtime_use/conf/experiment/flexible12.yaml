@@ -1,0 +1,6 @@
+# @package _global_
+defaults:
+- override /model: flexible12
+training:
+  sample_exit: true
+  split_decoders_at: 50000

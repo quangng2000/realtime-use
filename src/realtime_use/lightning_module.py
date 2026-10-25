@@ -1,0 +1,299 @@
+"""Lightning training for independently implemented causal speech enhancement.
+
+Manual optimization keeps generator-update counts explicit for both regression
+and two-optimizer GAN training. Checkpoints are taken only between updates.
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+import random
+from typing import Any
+
+from lightning.pytorch import LightningModule
+import torch
+from torch import Tensor
+
+from .config import ModelConfig
+from .discriminators import MultiScaleDiscriminator
+from .losses import ReconstructionLoss, discriminator_audio_loss, generator_audio_losses
+from .model import Enhancer
+
+
+def _finite(value: Tensor, name: str) -> None:
+    if not torch.isfinite(value).all():
+        raise FloatingPointError(f"Nonfinite {name}; update aborted. Inspect data or use full precision.")
+
+
+class EnhancementModule(LightningModule):
+    """Regression/KD or teacher-free GAN with stable decoder parameter registration."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        self.config = copy.deepcopy(config)
+        self.save_hyperparameters({"config": self.config})
+        self.automatic_optimization = False
+        self.training_config = self.config.get("training", {})
+        self.loss_config = self.config.get("loss", {})
+        self.adversarial_config = self.config.get("adversarial", {})
+        self.stage = self.training_config.get("stage", "regression")
+        if self.stage not in {"regression", "adversarial"}:
+            raise ValueError("training.stage must be regression or adversarial")
+        self.accumulation = int(self.training_config.get("grad_accum", 1))
+        self.target_updates = int(self.training_config.get("steps", 100000))
+        self.clip_norm = float(self.training_config.get("clip_grad_norm", 5.0))
+        self.base_lr = float(self.training_config.get("lr", 2e-4))
+        self.backbone_lr_scale = float(self.training_config.get("predecoder_lr_scale", 0.1))
+        self.weight_decay = float(self.training_config.get("weight_decay", 0.01))
+        numbers = (self.clip_norm, self.base_lr, self.backbone_lr_scale, self.weight_decay)
+        if (self.accumulation < 1 or self.target_updates < 1
+                or not all(math.isfinite(number) for number in numbers)
+                or self.clip_norm <= 0 or self.base_lr <= 0 or self.weight_decay < 0
+                or not 0 < self.backbone_lr_scale <= 1):
+            raise ValueError("Invalid accumulation, step count, clipping, or optimizer configuration")
+        self.split_at = self.training_config.get("split_decoders_at")
+        if self.split_at is not None and int(self.split_at) < 0:
+            raise ValueError("split_decoders_at must be nonnegative")
+        self.kd_weight = float(self.loss_config.get("kd", 0)) if self.stage == "regression" else 0.0
+        self.adversarial_weight = float(self.adversarial_config.get("weight", 0.01))
+        self.matching_weight = float(self.adversarial_config.get("feature_matching", 0.1))
+        if any(not math.isfinite(value) or value < 0 for value in
+               (self.kd_weight, self.adversarial_weight, self.matching_weight)):
+            raise ValueError("Loss weights must be finite and nonnegative")
+        self.model = Enhancer(ModelConfig.from_dict(self.config["model"]))
+        # All parameters and optimizer groups exist before Trainer/precision setup.
+        self.model.prepare_decoder_transition()
+        self._set_active_head_gradients()
+        self.criterion = ReconstructionLoss(float(self.loss_config.get("waveform", 1)),
+                                            float(self.loss_config.get("stft", 1)),
+                                            self.loss_config.get("fft_sizes", (256, 512, 1024)))
+        self.discriminator = (MultiScaleDiscriminator(int(self.adversarial_config.get("channels", 16)),
+                                                      int(self.adversarial_config.get("scales", 3)))
+                              if self.stage == "adversarial" else None)
+        self.register_buffer("completed_updates", torch.zeros((), dtype=torch.long))
+        self.microbatches_in_update = 0
+        self._update_metrics: dict[str, Tensor] = {}
+        self._generator_optimizer: torch.optim.Optimizer | None = None
+        self._validation_totals: dict[str, Tensor] = {}
+        self._validation_examples = 0
+
+    def _set_active_head_gradients(self) -> None:
+        shared = self.model.config.decoder_mode == "shared"
+        self.model.shared_decoder.requires_grad_(shared)
+        self.model.decoders.requires_grad_(not shared)
+
+    def forward(self, waveform: Tensor, exit_depths=None) -> dict[int, Tensor]:
+        return self.model.enhance(waveform, exit_depths=exit_depths)
+
+    def configure_optimizers(self):
+        backbone, heads = [], []
+        for name, parameter in self.model.named_parameters():
+            (heads if "decoder" in name else backbone).append(parameter)
+        backbone_lr = self.base_lr * (self.backbone_lr_scale
+                                      if self.model.config.decoder_mode == "per_exit" else 1.0)
+        generator = torch.optim.AdamW([
+            {"params": backbone, "lr": backbone_lr, "name": "backbone"},
+            {"params": heads, "lr": self.base_lr, "name": "decoders"},
+        ], lr=self.base_lr, weight_decay=self.weight_decay)
+        self._generator_optimizer = generator
+        if self.discriminator is None:
+            return generator
+        discriminator_lr = float(self.adversarial_config.get("lr", 2e-4))
+        if not math.isfinite(discriminator_lr) or discriminator_lr <= 0:
+            raise ValueError("adversarial.lr must be finite and positive")
+        critic = torch.optim.AdamW(self.discriminator.parameters(), lr=discriminator_lr, betas=(0.5, 0.9))
+        return [generator, critic]
+
+    def on_fit_start(self) -> None:
+        if self.trainer.world_size != 1:
+            raise RuntimeError("Multi-device/DDP training is not validated; use one CPU or one GPU per run")
+        if self.trainer.accumulate_grad_batches != 1:
+            raise ValueError("Set Trainer.accumulate_grad_batches=1; training.grad_accum controls manual accumulation")
+        self._set_active_head_gradients()
+        if int(self.completed_updates) >= self.target_updates:
+            raise ValueError("training.steps must exceed the completed generator updates in the checkpoint")
+
+    def _maybe_split_decoders(self, optimizer) -> None:
+        if (self.split_at is not None and int(self.completed_updates) >= int(self.split_at)
+                and self.model.config.decoder_mode == "shared"):
+            self.model.activate_prepared_decoders()
+            self._set_active_head_gradients()
+            for group in optimizer.param_groups:
+                if group["name"] == "backbone":
+                    group["lr"] = self.base_lr * self.backbone_lr_scale
+
+    def _optimizers(self):
+        optimizers = self.optimizers()
+        if self.discriminator is None:
+            return optimizers, None
+        return optimizers[0], optimizers[1]
+
+    def training_step(self, batch: dict[str, Any], batch_idx: int):
+        generator_optimizer, discriminator_optimizer = self._optimizers()
+        if self.microbatches_in_update == 0:
+            self._maybe_split_decoders(generator_optimizer)
+            generator_optimizer.zero_grad(set_to_none=True)
+            if discriminator_optimizer is not None:
+                discriminator_optimizer.zero_grad(set_to_none=True)
+            self._update_metrics = {}
+        noisy, clean, lengths = batch["noisy"], batch["clean"], batch.get("lengths")
+        _finite(noisy, "noisy input")
+        _finite(clean, "clean input")
+        exits = ([random.choice(self.model.config.exits)] if self.training_config.get("sample_exit", True)
+                 else list(self.model.config.exits))
+        predictions = self(noisy, exit_depths=exits)
+        reconstruction, metrics = [], {}
+        for prediction in predictions.values():
+            loss, details = self.criterion(prediction, clean, lengths=lengths)
+            reconstruction.append(loss)
+            for key, value in details.items():
+                metrics[key] = metrics.get(key, 0.0) + value / len(predictions)
+        generator_loss = torch.stack(reconstruction).mean()
+        metrics["clean_loss"] = generator_loss.detach()
+        if self.kd_weight:
+            if "teacher" not in batch:
+                raise ValueError("loss.kd > 0 requires aligned cached teacher audio")
+            _finite(batch["teacher"], "teacher target")
+            kd = torch.stack([self.criterion(prediction, batch["teacher"], lengths=lengths)[0]
+                              for prediction in predictions.values()]).mean()
+            generator_loss = generator_loss + self.kd_weight * kd
+            metrics["kd_loss"] = kd.detach()
+        if self.discriminator is not None:
+            enhanced = torch.cat(list(predictions.values()), dim=0)
+            reference = torch.cat([clean] * len(predictions), dim=0)
+            critic_lengths = lengths.repeat(len(predictions)) if lengths is not None else None
+            self.toggle_optimizer(discriminator_optimizer)
+            try:
+                critic_loss = discriminator_audio_loss(self.discriminator, reference, enhanced, critic_lengths)
+                _finite(critic_loss, "discriminator loss")
+                self.manual_backward(critic_loss / self.accumulation)
+            finally:
+                self.untoggle_optimizer(discriminator_optimizer)
+            self.toggle_optimizer(generator_optimizer)
+            try:
+                adversarial, matching = generator_audio_losses(self.discriminator, reference, enhanced, critic_lengths)
+                generator_loss = (generator_loss + self.adversarial_weight * adversarial
+                                  + self.matching_weight * matching)
+                _finite(generator_loss, "generator loss")
+                self.manual_backward(generator_loss / self.accumulation)
+            finally:
+                self.untoggle_optimizer(generator_optimizer)
+            metrics.update(discriminator_loss=critic_loss.detach(), adversarial_loss=adversarial.detach(),
+                           feature_matching_loss=matching.detach())
+        else:
+            _finite(generator_loss, "regression loss")
+            self.manual_backward(generator_loss / self.accumulation)
+        metrics["generator_loss"] = generator_loss.detach()
+        for key, value in metrics.items():
+            self._update_metrics[key] = self._update_metrics.get(key, 0.0) + value / self.accumulation
+        self.microbatches_in_update += 1
+        if self.microbatches_in_update == self.accumulation:
+            # Catch invalid accumulated gradients before either GAN optimizer can update.
+            for parameter in self.parameters():
+                if parameter.grad is not None:
+                    _finite(parameter.grad, "accumulated gradient")
+            if discriminator_optimizer is not None:
+                scaler = getattr(self.trainer.precision_plugin, "scaler", None)
+                old_scale = scaler.get_scale() if scaler is not None else None
+                discriminator_optimizer.step()
+                # Lightning updates its shared FP16 scaler after each optimizer.
+                # Pending G gradients were accumulated at the pre-D scale.
+                if scaler is not None and scaler.get_scale() != old_scale:
+                    ratio = scaler.get_scale() / old_scale
+                    for parameter in self.model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(ratio)
+            generator_optimizer.step()
+            self.completed_updates.add_(1)
+            self.microbatches_in_update = 0
+            self.log_dict(self._update_metrics, on_step=True, on_epoch=False,
+                          batch_size=len(noisy), logger=self.logger is not None)
+            self.log("completed_updates", self.completed_updates.float(), on_step=True, on_epoch=False,
+                     batch_size=len(noisy), logger=self.logger is not None)
+        return generator_loss.detach()
+
+    def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
+        # Lightning invokes this after AMP unscaling and before the optimizer update.
+        gradients = [parameter.grad for group in optimizer.param_groups for parameter in group["params"]
+                     if parameter.grad is not None]
+        if not gradients:
+            raise RuntimeError("No gradients reached the optimizer")
+        for gradient in gradients:
+            _finite(gradient, "unscaled gradient")
+        self.clip_gradients(optimizer, gradient_clip_val=self.clip_norm, gradient_clip_algorithm="norm")
+        for gradient in gradients:
+            _finite(gradient, "clipped gradient")
+
+    def on_validation_epoch_start(self) -> None:
+        if self.microbatches_in_update:
+            raise RuntimeError("Validate only between optimizer updates; align validation interval with grad_accum")
+        self._validation_totals = {}
+        self._validation_examples = 0
+
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:
+        predictions = self(batch["noisy"])
+        for depth, prediction in predictions.items():
+            loss, _ = self.criterion(prediction, batch["clean"], lengths=batch.get("lengths"))
+            _finite(loss, "validation loss")
+            key = f"validation_clean_loss_exit_{depth}"
+            self._validation_totals[key] = self._validation_totals.get(key, 0.0) + loss.detach() * len(prediction)
+        self._validation_examples += len(batch["noisy"])
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._validation_examples:
+            return
+        metrics = {key: value / self._validation_examples for key, value in self._validation_totals.items()}
+        metrics["validation_mean_clean_loss"] = torch.stack(list(metrics.values())).mean()
+        self.log_dict(metrics, on_step=False, on_epoch=True, logger=self.logger is not None)
+
+    def _portable_model_state(self) -> dict[str, Tensor]:
+        inactive = "decoders." if self.model.config.decoder_mode == "shared" else "shared_decoder."
+        return {key: value for key, value in self.model.state_dict().items() if not key.startswith(inactive)}
+
+    def portable_checkpoint(self) -> dict[str, Any]:
+        return {"format_version": 2, "model_config": self.model.config.to_dict(),
+                "model_state": self._portable_model_state(), "stage": self.stage,
+                "step": int(self.completed_updates),
+                "training_config": {**self.config, "model": self.model.config.to_dict()}}
+
+    def load_portable_weights(self, payload: dict[str, Any]) -> None:
+        """Initialize active weights without importing optimizer state or update counts."""
+        saved = ModelConfig.from_dict(payload["model_config"])
+        requested, actual = self.model.config.to_dict(), saved.to_dict()
+        for key in ("decoder_mode", "scan_backend"):
+            requested.pop(key)
+            actual.pop(key)
+        if requested != actual:
+            raise ValueError("Checkpoint architecture differs from the requested model")
+        self.model.config.decoder_mode = saved.decoder_mode
+        expected = set(self._portable_model_state())
+        if set(payload["model_state"]) != expected:
+            raise ValueError("Portable checkpoint has missing or unexpected model parameters")
+        combined = self.model.state_dict()
+        combined.update(payload["model_state"])
+        self.model.load_state_dict(combined, strict=True)
+        self._set_active_head_gradients()
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        if self.microbatches_in_update:
+            raise RuntimeError("Checkpoint only at completed updates; partial accumulated gradients are not saved")
+        checkpoint.update(self.portable_checkpoint())
+        checkpoint["python_rng_state"] = random.getstate()
+        checkpoint["torch_rng_state"] = torch.get_rng_state()
+        if torch.cuda.is_available():
+            checkpoint["cuda_rng_states"] = torch.cuda.get_rng_state_all()
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        if checkpoint.get("stage") != self.stage:
+            raise ValueError("Native resume must preserve stage; use portable initialization for a new stage")
+        self.model.config.decoder_mode = checkpoint["model_config"]["decoder_mode"]
+        self._set_active_head_gradients()
+        self.microbatches_in_update = 0
+        if "python_rng_state" in checkpoint:
+            random.setstate(checkpoint["python_rng_state"])
+        if "torch_rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "cuda_rng_states" in checkpoint:
+            if len(checkpoint["cuda_rng_states"]) == torch.cuda.device_count():
+                torch.cuda.set_rng_state_all([state.cpu() for state in checkpoint["cuda_rng_states"]])

@@ -1,0 +1,17 @@
+# Independent recipe; steps count generator updates, not a published schedule.
+stage: regression
+steps: 100000
+batch_size: 4
+crop_seconds: 2.0
+lr: 0.0002
+weight_decay: 0.01
+grad_accum: 1
+clip_grad_norm: 5.0
+sample_exit: false
+split_decoders_at: null
+predecoder_lr_scale: 0.1
+workers: 0
+checkpoint_every: 1000
+log_every: 10
+validate_every: 1000
+validation_batches: 20

@@ -1,0 +1,14 @@
+sample_rate: 16000
+window_ms: 40.0
+hop_ms: 20.0
+depth: 12
+exits:
+- 4
+- 8
+- 12
+width: 64
+state_dim: 16
+expand: 4
+conv_kernel: 4
+decoder_mode: shared
+scan_backend: auto

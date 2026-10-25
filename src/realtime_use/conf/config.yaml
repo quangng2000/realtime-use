@@ -1,0 +1,22 @@
+defaults:
+- model: fixed4
+- training: regression
+- data: paired
+- loss: reconstruction
+- adversarial: default
+- trainer: default
+- experiment: null
+- _self_
+seed: 0
+output_dir: ${hydra:runtime.output_dir}
+init_from: null
+resume: null
+smoke: false
+hydra:
+  run:
+    dir: runs/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+  sweep:
+    dir: runs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false

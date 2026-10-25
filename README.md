@@ -1,6 +1,6 @@
 # realtime-use
 
-An independent PyTorch research implementation for small, causal speech enhancement models with **4, 8, or 12 time–frequency blocks**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
+An independent PyTorch research implementation for small, causal speech enhancement models with **4, 8, or 12 time–frequency blocks**, trained with **PyTorch Lightning and Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
 
 The project uses the methods in [One Model, Many Latencies](https://arxiv.org/abs/2606.25621) and [Rethinking Training Targets, Architectures and Data Quality](https://arxiv.org/abs/2603.02641) as research references. It does not download or include NVIDIA checkpoints or restricted model source code. Models start from random initialization unless you explicitly supply your own compatible checkpoint.
 
@@ -33,9 +33,9 @@ For accelerated training, first configure a compatible CUDA PyTorch and build en
 python -m pip install -e '.[cuda]'
 ```
 
-Set `model.scan_backend: mamba_ssm` to require the CUDA scan kernel and fail clearly if it is unavailable. The supplied `auto` setting can fall back to the much slower reference implementation. Initial verification is CPU-only: CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
+Pass `model.scan_backend=mamba_ssm` to require the CUDA scan kernel and fail clearly if it is unavailable. The supplied `auto` setting can fall back to the much slower reference implementation. Initial verification is CPU-only: CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
 
-The current trainer uses one device. Distributed data-parallel training is not implemented.
+The current implementation supports one CPU or one GPU device and rejects distributed execution. Lightning integration does not establish multi-GPU scaling or DDP correctness.
 
 ## Prepare your data
 
@@ -53,9 +53,10 @@ The two recordings must be mono, have the same sample rate and length, and alrea
 
 ```bash
 python -m realtime_use.train \
-  --config configs/fixed4.yaml \
-  --output runs/smoke4 \
-  --device cpu --smoke --steps 2
+  experiment=fixed4 \
+  smoke=true training.steps=2 \
+  trainer.accelerator=cpu trainer.devices=1 \
+  output_dir=runs/smoke4
 ```
 
 Smoke mode overrides the supplied architecture with **one block at width 4** and runs at most three tiny synthetic steps. Its data contains tones and noise. A successful run checks the software path only; it cannot establish speech enhancement quality or the memory/runtime requirements of the real 4-, 8-, or 12-block configurations. Benchmark those configurations separately on the intended GPU.
@@ -66,49 +67,70 @@ Start by training each fixed depth independently. This isolates the quality and 
 
 ```bash
 python -m realtime_use.train \
-  --config configs/fixed4.yaml \
-  --manifest data/train.jsonl \
-  --output runs/fixed4-regression \
-  --stage regression --device cuda
+  experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  training.stage=regression \
+  trainer.accelerator=gpu trainer.devices=1 \
+  output_dir=runs/fixed4-regression
 ```
 
-Use `configs/fixed8.yaml` or `configs/fixed12.yaml` and a separate output directory for the other baselines. Set the training budget, crop duration, batch size, and validation plan for your dataset; the supplied settings are starting configurations, not the authors' recovered training schedule.
+Use `experiment=fixed8` or `experiment=fixed12` and a separate output directory for the other baselines. Set the training budget, crop duration, batch size, and validation plan for your dataset; the supplied settings are starting configurations, not the authors' recovered training schedule.
+
+Hydra composes the `model`, `data`, `training`, `loss`, `adversarial`, `trainer`, and `experiment` groups. Inspect the resolved job before training:
+
+```bash
+python -m realtime_use.train experiment=fixed4 --cfg job --resolve
+```
+
+Run the three fixed baselines as a Hydra sweep:
+
+```bash
+python -m realtime_use.train -m \
+  experiment=fixed4,fixed8,fixed12 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  data.validation_manifest=/absolute/path/to/validation.jsonl \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+Use isolated output directories for each job. A sweep starts multiple training runs; it does not split one model across GPUs. See [training configuration and migration](docs/training.md) for overrides, checkpoints, and update-count semantics.
 
 The regression loss combines waveform L1 with multi-resolution spectral convergence and log-magnitude losses. These are independently chosen objectives. Their definitions live in `src/realtime_use/losses.py`; they should not be described as a verified copy of the papers' loss implementation.
 
-The trainer writes `last.pt` at completion and periodic `checkpoint_*.pt` files. Add `--validation-manifest data/validation.jsonl` to select a `best.pt` checkpoint using held-out reconstruction loss averaged over exits. Validation uses fixed crops and a bounded batch count controlled by `training.validation_batches`; this selection metric is not UTMOS, a listening-test result, or a full official benchmark.
+The trainer writes a native Lightning checkpoint at `checkpoints/last.ckpt` inside the run's output directory. With a validation manifest, it can select `checkpoints/best.ckpt` using held-out reconstruction loss averaged over exits. Validation uses fixed crops and the configured validation limit; this selection metric is not UTMOS, a listening-test result, or a full official benchmark.
 
 ## Add adversarial fine-tuning
 
 First obtain and evaluate a regression checkpoint. Then initialize adversarial training from that checkpoint:
 
 ```bash
-REGRESSION_CHECKPOINT=runs/fixed4-regression/last.pt
+REGRESSION_CHECKPOINT=/absolute/path/to/runs/fixed4-regression/checkpoints/last.ckpt
 python -m realtime_use.train \
-  --config configs/fixed4.yaml \
-  --manifest data/train.jsonl \
-  --output runs/fixed4-adversarial \
-  --stage adversarial \
-  --init-from "$REGRESSION_CHECKPOINT" \
-  --device cuda
+  experiment=fixed4 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  training.stage=adversarial \
+  "init_from=$REGRESSION_CHECKPOINT" \
+  trainer.accelerator=gpu trainer.devices=1 \
+  output_dir=runs/fixed4-adversarial
 ```
 
 Here the enhancement network remains trainable, with hinge-GAN and feature-matching losses in addition to clean-reference reconstruction. Inference still uses one enhancement network. Teacher tensors are ignored in this stage. Discriminators and the precise adversarial objective are our implementation choices.
 
 This follows the real-time paper's broad regression-then-adversarial approach. The offline RE-USE paper instead freezes a regression network and trains a separate residual generator; that two-network inference design is not implemented here. See [method boundaries](docs/method.md).
 
-Use `--resume` to continue a compatible interrupted run, including optimizer state; the data iterator restarts, so continuation is not bit-exact. `--steps` is the total target optimizer-step count, including prior steps. Use `--init-from` to initialize a new stage with a fresh optimizer and step count. Do not treat these as interchangeable operations.
+Use `resume=/absolute/path/to/checkpoint.ckpt` to continue a compatible Lightning run, including optimizer and loop state. Exact data-order continuation is not guaranteed. `training.steps` is the total target number of generator updates, including prior updates on resume. Use `init_from=/absolute/path/to/checkpoint.ckpt` to initialize a new stage with a fresh optimizer and update count. Do not treat these as interchangeable operations.
 
 ## Train one model with several exits
 
-After the fixed baselines are understood, `configs/flexible12.yaml` enables a depth-12 model with exits at 4, 8, and 12. Shared-decoder training and a later shared-to-per-exit decoder transition are separate from the regression-to-adversarial loss transition.
+After the fixed baselines are understood, `experiment=flexible12` enables a depth-12 model with exits at 4, 8, and 12. Shared-decoder training and a later shared-to-per-exit decoder transition are separate from the regression-to-adversarial loss transition.
 
 ```bash
 python -m realtime_use.train \
-  --config configs/flexible12.yaml \
-  --manifest data/train.jsonl \
-  --output runs/flexible12-regression \
-  --stage regression --device cuda
+  experiment=flexible12 \
+  data.train_manifest=/absolute/path/to/train.jsonl \
+  training.stage=regression \
+  trainer.accelerator=gpu trainer.devices=1 \
+  output_dir=runs/flexible12-regression
 ```
 
 `training.sample_exit` controls exit sampling. `training.split_decoders_at` schedules cloning the learned shared decoder into per-exit decoders; `training.predecoder_lr_scale` controls the preceding modules' learning-rate scale at that transition. Choose these settings explicitly for the experiment. The complete authors' schedule, and its precise ordering relative to adversarial fine-tuning, are not available in the reviewed materials.
@@ -121,7 +143,7 @@ After training a flexible model, extract one of its trained exits:
 
 ```bash
 python -m realtime_use.export \
-  --checkpoint runs/flexible12-regression/last.pt \
+  --checkpoint runs/flexible12-regression/checkpoints/last.ckpt \
   --exit-depth 4 \
   --output runs/export/exit4.pt
 ```
@@ -134,9 +156,11 @@ Export verifies full/streaming output equivalence on a short deterministic CPU s
 
 Use a checkpoint from your own run. Input must be mono and match its configured sample rate.
 
+Native Lightning `.ckpt` files retain `model_config` and `model_state` compatibility fields for these existing tools. Inference, evaluation, export, and benchmarking keep their flag-based interfaces; the Hydra migration applies to training.
+
 ```bash
 python -m realtime_use.infer \
-  --checkpoint runs/fixed4-regression/last.pt \
+  --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --input data/noisy/example.wav \
   --output runs/example-enhanced.wav \
   --exit-depth 4 --stream --device cpu
@@ -146,7 +170,7 @@ Evaluate only exits configured in that checkpoint:
 
 ```bash
 python -m realtime_use.evaluate \
-  --checkpoint runs/fixed4-regression/last.pt \
+  --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --manifest data/validation.jsonl \
   --output runs/fixed4-evaluation.json \
   --exits 4 --stream --check-clean --device cpu
@@ -156,7 +180,7 @@ Benchmark the actual streaming path independently from quality evaluation:
 
 ```bash
 python -m realtime_use.benchmark \
-  --checkpoint runs/fixed4-regression/last.pt \
+  --checkpoint runs/fixed4-regression/checkpoints/last.ckpt \
   --output runs/fixed4-timing.json \
   --exit-depth 4 --seconds 10 --warmup-seconds 1 \
   --device cpu --threads 1
@@ -172,7 +196,7 @@ With the supplied width-64, expansion-4, state-dimension-16 configurations, the 
 - Eight-block exit: **1,687,746**.
 - Twelve-block exit: **2,512,066**.
 
-The flexible 12-block model stores 2,512,066 parameters with a shared decoder and 2,586,438 after creating all three per-exit decoders. Active counts include one selected decoder. Re-measure after architecture changes:
+An enhancement-only flexible 12-block model stores 2,512,066 parameters with a shared decoder and 2,586,438 with three per-exit decoders. Active counts include one selected decoder. The Lightning training module/checkpoint can additionally retain transition heads, discriminators, and optimizer state; these inference-model counts are not its total memory footprint. Re-measure after architecture changes:
 
 ```python
 from realtime_use.config import ModelConfig
@@ -187,10 +211,10 @@ These are counts for our independent encoder/decoder and are not directly compar
 
 Measure streaming p50/p95/p99 processing time at batch size one on the target machine, including the audio framing path. With a 20 ms hop, sustained processing must fit within 20 ms per hop. The 40 ms analysis window is an algorithmic latency component; audio-device buffering and processing time add to it.
 
-For a training-time estimate, benchmark the intended crop length, sample rate, precision, batch size, and training stage. Multiply measured seconds per optimizer step by the planned step count, then add data preparation, validation, and checkpoint overhead. Published inference timing is not a training-throughput benchmark.
+For a training-time estimate, benchmark the intended crop length, sample rate, precision, batch size, and training stage. Multiply measured seconds per generator update by `training.steps`, then add data preparation, validation, and checkpoint overhead. An adversarial update includes both discriminator and generator work. Published inference timing is not a training-throughput benchmark.
 
 See [the experiment roadmap and acceptance gates](docs/experiments.md) for validation and deployment criteria.
 
 ## Repository and materials
 
-The intended repository is private: `quangng2000/realtime-use`. No public software license has been selected. See [NOTICE.md](NOTICE.md) and [the provenance ledger](docs/provenance.md) for the boundary between this project's code, third-party dependencies, research references, and future training materials.
+The repository is public at [quangng2000/realtime-use](https://github.com/quangng2000/realtime-use). No public software license has been selected. See [NOTICE.md](NOTICE.md) and [the provenance ledger](docs/provenance.md) for the boundary between this project's code, third-party dependencies, research references, and future training materials.
