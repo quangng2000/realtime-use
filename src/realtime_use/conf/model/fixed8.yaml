@@ -11,3 +11,4 @@ conv_kernel: 4
 decoder_mode: shared
 scan_backend: auto
 mixer_impl: mamba_ssm
+codec_impl: nemotron_causal

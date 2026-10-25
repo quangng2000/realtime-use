@@ -134,7 +134,7 @@ def test_official_cuda_sequence_step_and_serialized_stream_state(official_cuda):
 def test_official_cuda_enhancer_reload_streaming_and_export(official_cuda, decoder_mode, tmp_path):
     cfg = ModelConfig(sample_rate=800, depth=2, exits=(1, 2), width=8, state_dim=4,
                       expand=2, conv_kernel=4, decoder_mode=decoder_mode,
-                      mixer_impl="mamba_ssm", scan_backend="auto")
+                      mixer_impl="mamba_ssm", scan_backend="auto", codec_impl="nemotron_causal")
     original = Enhancer(cfg).cuda().eval()
     restored = Enhancer(ModelConfig.from_dict(cfg.to_dict())).cuda().eval()
     restored.load_state_dict(original.state_dict(), strict=True)

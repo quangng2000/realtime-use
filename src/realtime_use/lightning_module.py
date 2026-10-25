@@ -21,7 +21,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torchmetrics.aggregation import MeanMetric
 
 from .config import ModelConfig
-from .discriminators import MultiScaleDiscriminator
+from .discriminators import build_discriminator
 from .losses import ReconstructionLoss, discriminator_audio_loss, generator_audio_losses
 from .model import Enhancer
 
@@ -86,8 +86,7 @@ class EnhancementModule(LightningModule):
                                             float(self.loss_config.get("stft", 1)),
                                             self.loss_config.get("fft_sizes", (256, 512, 1024)),
                                             implementation=self.loss_config.get("implementation", "legacy"))
-        self.discriminator = (MultiScaleDiscriminator(int(self.adversarial_config.get("channels", 16)),
-                                                      int(self.adversarial_config.get("scales", 3)))
+        self.discriminator = (build_discriminator(self.adversarial_config, self.model.config.sample_rate)
                               if self.stage == "adversarial" else None)
         self.register_buffer("completed_updates", torch.zeros((), dtype=torch.long))
         self.microbatches_in_update = 0

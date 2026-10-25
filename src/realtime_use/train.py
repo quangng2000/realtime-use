@@ -111,13 +111,13 @@ def prepare_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
     settings = copy.deepcopy(settings)
     if settings.get("smoke", False):
         settings["model"].update(depth=1, exits=[1], width=4, state_dim=2, expand=1,
-                                  decoder_mode="shared", mixer_impl="legacy", scan_backend="reference")
+                                  decoder_mode="shared", codec_impl="legacy", mixer_impl="legacy", scan_backend="reference")
         settings["training"].update(steps=min(3, int(settings["training"]["steps"])),
             batch_size=1, crop_seconds=0.08, workers=0, grad_accum=1,
             split_decoders_at=None, checkpoint_every=1, log_every=1,
             validate_every=1, validation_batches=1)
         settings["loss"].update(fft_sizes=[64, 128], kd=0.0)
-        settings["adversarial"].update(channels=4, scales=2)
+        settings["adversarial"].update(channels=4, scales=2, implementation="legacy")
         settings["data"]["smoke"] = True
         settings["trainer"]["precision"] = "32-true"
         torch.set_num_threads(1)
@@ -200,9 +200,16 @@ def _checkpoint_config(settings: dict[str, Any], checkpoint: dict[str, Any]) -> 
         # Changing optimizer structure/objective mid-resume is a fresh experiment.
         for group in ("loss", "adversarial"):
             old_group, new_group = dict(previous.get(group, {})), dict(settings[group])
-            if group == "loss":
+            if group in {"loss", "adversarial"}:
                 old_group.setdefault("implementation", "legacy")
                 new_group.setdefault("implementation", "legacy")
+            if group == "adversarial":
+                # Newly introduced, inactive knobs must not prevent old critic
+                # checkpoints from resuming with their original architecture.
+                for values in (old_group, new_group):
+                    unused = ("fft_sizes", "band_width_hz") if values["implementation"] == "legacy" else ("channels", "scales")
+                    for key in unused:
+                        values.pop(key, None)
             if group in previous and old_group != new_group:
                 raise ValueError(f"resume must preserve {group}; use init_from for a fresh experiment")
         for key in ("lr", "weight_decay", "grad_accum", "predecoder_lr_scale", "sample_exit", "split_decoders_at"):

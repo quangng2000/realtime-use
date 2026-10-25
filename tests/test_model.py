@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from realtime_use.config import ModelConfig
-from realtime_use.model import Enhancer
+from realtime_use.model import Enhancer, TimeFrequencyBlock
 from realtime_use.ssm import SelectiveMixer
 
 
@@ -30,7 +30,47 @@ def test_old_checkpoint_config_retains_legacy_mixer_and_parameter_layout():
     assert restored.config.mixer_impl == "legacy"
     assert isinstance(restored.blocks[0].temporal, SelectiveMixer)
     assert "blocks.0.temporal.in_projection.weight" in restored.state_dict()
+    assert not any("temporal_projection" in key for key in restored.state_dict())
     restored.load_state_dict(Enhancer(tiny_config()).state_dict(), strict=True)
+
+
+@pytest.mark.parametrize("frequency_bins", [4, 5])
+def test_author_topology_block_matches_streaming_and_is_causal(frequency_bins):
+    # The explicit reference mixer permits CPU topology/state tests. Production
+    # configurations select the official Mamba implementation separately.
+    block = TimeFrequencyBlock(tiny_config(codec_impl="nemotron_causal"))
+    values = torch.randn(2, 7, frequency_bins, 4, requires_grad=True)
+    full = block(values)
+    state, pieces = None, []
+    for frame in values.unbind(1):
+        output, state = block.step(frame, state)
+        pieces.append(output)
+    torch.testing.assert_close(full, torch.stack(pieces, 1), atol=2e-6, rtol=2e-5)
+    changed = values.detach().clone()
+    changed[:, 4:] += 50 * torch.randn_like(changed[:, 4:])
+    torch.testing.assert_close(full[:, :4], block(changed)[:, :4], atol=2e-6, rtol=2e-5)
+    first_frame, _ = block.step(values[:, 0], None)
+    torch.testing.assert_close(first_frame, full[:, 0], atol=2e-6, rtol=2e-5)
+    full.square().mean().backward()
+    assert torch.isfinite(values.grad).all()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all()
+               for parameter in block.parameters())
+
+
+def test_author_topology_runs_temporal_before_both_frequency_directions():
+    block = TimeFrequencyBlock(tiny_config(codec_impl="nemotron_causal"))
+    calls = []
+    handles = [module.register_forward_hook(lambda _module, _args, _output, name=name: calls.append(name))
+               for name, module in [("time", block.temporal),
+                                    ("frequency_forward", block.frequency_forward),
+                                    ("frequency_backward", block.frequency_backward)]]
+    try:
+        block(torch.randn(1, 3, 5, 4))
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert calls == ["time", "frequency_forward", "frequency_backward"]
+    assert "temporal_projection.weight" in block.state_dict()
 
 
 @pytest.mark.parametrize("values", [

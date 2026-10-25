@@ -1,3 +1,6 @@
+implementation: dac_mrd
+fft_sizes: [512, 1024, 2048]
+band_width_hz: 4000
 lr: 0.0002
 weight: 0.01
 feature_matching: 0.1

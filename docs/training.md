@@ -6,9 +6,9 @@ Training uses a LightningModule, an aligned-audio LightningDataModule, and Hydra
 
 Hydra composes configurations and launches independent sweeps. Lightning owns process setup, optimizer and loop restoration, precision handling, CSV logging, and checkpoint selection and serialization. Two native `ModelCheckpoint` callbacks manage periodic snapshots and the lowest validation loss; the project does not maintain a separate best-score tracker.
 
-New model presets use the official Mamba-1 class. PyTorch supplies STFT/iSTFT and waveform L1, `auraloss` supplies multi-resolution spectral losses, TorchMetrics supplies validation means and signal-quality formulas, and optional `audiomentations` transforms supply training corruptions. Project adapters handle valid utterance lengths, paired-data semantics, and stream/exit selection. The legacy mixer and spectral loss remain available for existing checkpoints; they are not the default Hydra training recipe.
+New model presets use official Mamba-1 and the licensed NVIDIA dense encoder/magnitude/phase decoder components adapted for causality. GAN presets import DAC's spectral discriminator. PyTorch supplies STFT/iSTFT and waveform L1, `auraloss` supplies multi-resolution spectral losses, TorchMetrics supplies validation means and signal-quality formulas, and optional `audiomentations` transforms supply training corruptions. Project adapters handle causal state, valid utterance lengths, paired-data semantics, and exit selection. Legacy components remain available for existing checkpoints; they are not the default Hydra training recipe.
 
-`loss.implementation=auraloss` uses centered Hann STFTs with hop sizes one quarter of each configured FFT size, spectral-convergence and log-magnitude weights of one, and no phase/perceptual term. Valid utterance prefixes are evaluated separately so batch composition and DDP sharding do not alter their relative weights. Very short prefixes receive deterministic zero extension for the library's reflection padding. This objective differs from the previous uncentered custom loss. To resume an older run, select both `model.mixer_impl=legacy` and `loss.implementation=legacy`; resume rejects an objective or architecture change. `init_from` can deliberately start a new objective with compatible architecture and fresh optimizer state.
+`loss.implementation=auraloss` uses centered Hann STFTs with hop sizes one quarter of each configured FFT size, spectral-convergence and log-magnitude weights of one, and no phase/perceptual term. Valid utterance prefixes are evaluated separately so batch composition and DDP sharding do not alter their relative weights. Very short prefixes receive deterministic zero extension for the library's reflection padding. This objective differs from the previous uncentered custom loss. Resume must preserve the checkpoint's `model.mixer_impl`, `model.codec_impl`, `loss.implementation` and `adversarial.implementation`; missing identity fields mean legacy. Runs from before the library migration use all legacy components, while runs from the intermediate Mamba migration may use official Mamba with the legacy codec. Inspect the saved configuration rather than switching all fields blindly. `init_from` can deliberately start a new objective/critic with compatible enhancement architecture and fresh optimizer state; it cannot convert codec or mixer weights.
 
 The remaining checkpoint adapter checks that manual gradient accumulation has finished before delegating a periodic save. A small run callback writes the resolved configuration, rejects accidental reuse of an existing run, signals the generator-update budget, and refreshes `last.ckpt` on every rank before distributed teardown. Signaling the budget also lets Lightning run any final validation inside `fit`, including when the budget is not a validation-interval multiple.
 
@@ -26,15 +26,17 @@ Start in the repository root with an NVIDIA driver compatible with CUDA 12.8 and
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel packaging ninja
-python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
 nvcc --version
-python -m pip install --no-build-isolation -e ".[cuda,test]"
+python -m pip install --no-build-isolation -e ".[cuda,gan,test,augmentation]"
 python -m pip check
 ```
 
 Install PyTorch before the extensions and retain `--no-build-isolation`, so their build uses that installed CUDA-enabled PyTorch. These commands target the pinned releases and their [release build setup](https://github.com/state-spaces/mamba/blob/v2.2.6.post3/setup.py); newer upstream `main` installation flags can differ. The Mamba-1 pin avoids adding the unrelated Mamba-3 dependency stack. It is not a claim that this is the newest Mamba package.
 
-For Linux CPU development, install a CPU PyTorch wheel first (`python -m pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cpu`), then `python -m pip install -e ".[test]"`. Do not install the CUDA extra for CPU smoke tests. The smoke configuration selects the legacy reference mixer; it does not exercise the official CUDA class.
+For the complete Linux CPU test suite, first install matching CPU wheels (`python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu`), then `python -m pip install -e ".[test,augmentation,gan]"`. CI uses this combination. The author codec and actual DAC tests execute on CPU with explicitly selected reference mixers; official Mamba numerical tests require CUDA. Do not install the CUDA extra for CPU smoke tests. Smoke selects the legacy codec, reference mixer and legacy critic; it does not exercise the new architecture.
+
+The `gan` extra pins `descript-audio-codec==1.0.0` and `descript-audiotools==0.7.2`. Install torchaudio alongside the matching PyTorch build: dependency resolution alone does not guarantee matching extension binaries. The adapter uses DAC's `MRD` directly, avoiding the enclosing wrapper's periodic critics and amplitude normalization. `adversarial.fft_sizes` and `adversarial.band_width_hz` select STFT scales and approximate band width; `channels` and `scales` apply only to the legacy critic.
 
 Official Mamba checkpoints require `--device cuda` for inference, evaluation, benchmarking, and exit export. Loading one on CPU raises an error rather than changing its architecture. Export retains the chosen official Mamba blocks and verifies full/stream outputs on the requested CUDA device. Legacy checkpoints keep their original parameter layout and CPU reference support; they cannot initialize the official architecture through a backend switch.
 
@@ -44,11 +46,11 @@ Run `python -m pytest -q tests/test_official_mamba.py` on that CUDA host before 
 
 Canonical configs are packaged under `src/realtime_use/conf`, so the installed command can compose them outside the repository root. The groups are:
 
-- `model`: audio framing, depth, exits, dimensions, decoder mode, mixer implementation, and legacy scan backend.
+- `model`: audio framing, depth, exits, dimensions, decoder mode, codec/mixer implementations, and legacy scan backend.
 - `data`: training/validation manifests and data-loading options.
 - `training`: stage, generator-update budget, batch/crop/worker settings, optimizer settings, accumulation, and decoder transition.
 - `loss`: supervised reconstruction and optional cached-output distillation.
-- `adversarial`: discriminator size and adversarial/feature-matching weights.
+- `adversarial`: critic implementation, STFT scales/bands (or legacy size), and adversarial/feature-matching weights.
 - `trainer`: Lightning accelerator, devices, precision, and runtime options.
 - `experiment`: the composed `fixed4`, `fixed8`, `fixed12`, or `flexible12` starting recipe.
 

@@ -19,6 +19,7 @@ class ModelConfig:
     expand: int = 4
     conv_kernel: int = 4
     decoder_mode: str = "shared"
+    codec_impl: str = "legacy"
     mixer_impl: str = "legacy"
     scan_backend: str = "reference"
 
@@ -42,6 +43,8 @@ class ModelConfig:
             raise ValueError("Each exit must be an integer between 1 and depth")
         if self.decoder_mode not in {"shared", "per_exit"}:
             raise ValueError("decoder_mode must be shared or per_exit")
+        if self.codec_impl not in {"legacy", "nemotron_causal"}:
+            raise ValueError("codec_impl must be legacy or nemotron_causal")
         if self.mixer_impl not in {"legacy", "mamba_ssm"}:
             raise ValueError("mixer_impl must be legacy or mamba_ssm")
         if self.scan_backend not in {"reference", "auto", "mamba_ssm"}:

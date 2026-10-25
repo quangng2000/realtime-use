@@ -25,8 +25,8 @@ def tiny_config(output_dir):
             "training.batch_size=1", "training.crop_seconds=0.008",
             "model.sample_rate=8000", "model.window_ms=4", "model.hop_ms=2",
             "model.depth=1", "model.exits=[1]", "model.width=4", "model.state_dim=2",
-            "model.expand=1", "model.conv_kernel=2", "model.scan_backend=reference", "model.mixer_impl=legacy",
-            "loss.fft_sizes=[32,64]", "adversarial.channels=2", "adversarial.scales=1",
+            "model.expand=1", "model.conv_kernel=2", "model.scan_backend=reference", "model.mixer_impl=legacy", "model.codec_impl=legacy",
+            "loss.fft_sizes=[32,64]", "adversarial.channels=2", "adversarial.scales=1", "adversarial.implementation=legacy",
             "trainer.accelerator=cpu", "trainer.enable_progress_bar=false",
             "trainer.enable_model_summary=false", "trainer.num_sanity_val_steps=0",
         ])
@@ -103,8 +103,12 @@ def test_pre_library_native_checkpoint_resumes_only_with_legacy_objective(tmp_pa
         path = run_training(cfg)
         saved = torch.load(path, weights_only=True)
         saved["model_config"].pop("mixer_impl")
+        saved["model_config"].pop("codec_impl")
         saved["hyper_parameters"]["config"]["model"].pop("mixer_impl")
+        saved["hyper_parameters"]["config"]["model"].pop("codec_impl")
         saved["hyper_parameters"]["config"]["loss"].pop("implementation")
+        for key in ("implementation", "fft_sizes", "band_width_hz"):
+            saved["hyper_parameters"]["config"]["adversarial"].pop(key)
         torch.save(saved, path)
         cfg.resume = str(path)
         cfg.training.steps = 2

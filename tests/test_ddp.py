@@ -205,7 +205,7 @@ def test_hydra_internal_ddp_and_external_torchrun_gan_entrypoints(tmp_path):
               "training.crop_seconds=0.16", "training.grad_accum=2", "training.workers=0",
               "training.checkpoint_every=1", "training.validate_every=1", "training.validation_batches=20",
               "training.log_every=1", "loss.fft_sizes=[16,32]", "loss.stft=0.1",
-              "adversarial.channels=4", "adversarial.scales=1",
+              "adversarial.fft_sizes=[64]",
               "trainer.accelerator=cpu", "trainer.devices=2", "trainer.strategy=ddp",
               "trainer.enable_progress_bar=false", f"data.train_manifest={train}",
               f"data.validation_manifest={validation}"]

@@ -1,8 +1,10 @@
 # realtime-use
 
-An independent PyTorch research implementation for small, causal speech enhancement models with **4, 8, or 12 time–frequency blocks**, using **official `mamba_ssm.Mamba` blocks**, **PyTorch Lightning**, and **Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
+A PyTorch research training project for causal speech enhancement with **4, 8, or 12 time–frequency blocks**, using **official `mamba_ssm.Mamba` blocks**, a **licensed NVIDIA codec adapted for streaming**, **DAC spectral discriminators**, **PyTorch Lightning**, and **Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
 
 The project uses the methods in [One Model, Many Latencies](https://arxiv.org/abs/2606.25621) and [Rethinking Training Targets, Architectures and Data Quality](https://arxiv.org/abs/2603.02641) as research references. It does not download or include NVIDIA checkpoints or restricted model source code. Models start from random initialization unless you explicitly supply your own compatible checkpoint.
+
+New presets reuse NVIDIA's [NemotronLabs RE-USE codec source under OpenMDW-1.1](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE/tree/31f82f2efad1095034492f236e8dac9239ba713b) and [Descript DAC's MIT-licensed multiband STFT critic](https://github.com/descriptinc/descript-audio-codec/blob/c7cfc5d2647e26471dc394f95846a0830e7bec34/dac/model/discriminator.py). The original codec source and license are retained unchanged; a small adapter applies the paper's causal changes. This is separate from the noncommercial Real-time RE-USE release. See [source provenance](docs/provenance.md) and [remaining paper differences](docs/method.md).
 
 **Status:** a training and streaming baseline for experiments. It is not an exact reproduction of either paper, a pretrained enhancement product, or evidence of published quality or latency. The complete URGENT degradation pipeline, sample-rate-independent training, and adjustable look-ahead remain future work. The official Mamba path requires CUDA; the earlier independent mixer remains an explicitly selected legacy CPU baseline. Deployment speed must be measured on the intended hardware.
 
@@ -14,15 +16,16 @@ Python 3.11 or 3.12 is recommended. From the repository root:
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[test]'
+python -m pip install torch==2.7.1 torchaudio==2.7.1
+python -m pip install -e '.[test,augmentation,gan]'
 python -m pytest -q
 ```
 
 For a CPU-only PyTorch install, install the appropriate wheel first:
 
 ```bash
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -e '.[test]'
+python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e '.[test,augmentation,gan]'
 ```
 
 The CPU reference backend needs neither a paid GPU nor a pretrained model. The CI workflow is configured to test that path on Ubuntu with Python 3.11 and 3.12.
@@ -30,12 +33,14 @@ The CPU reference backend needs neither a paid GPU nor a pretrained model. The C
 For training with official Mamba, first configure a compatible Linux CUDA PyTorch and build environment, then install the optional dependencies (see the versioned recipe in [training.md](docs/training.md)):
 
 ```bash
-python -m pip install -e '.[cuda]' --no-build-isolation
+python -m pip install -e '.[cuda,gan]' --no-build-isolation
 ```
 
 All four Hydra model presets select `model.mixer_impl=mamba_ssm`: the complete official Mamba-1 block, including parameter initialization, sequence processing, and recurrent inference. This architecture never falls back to the custom mixer. `model.scan_backend=auto` is retained for configuration compatibility; changing scan kernels applies only to `model.mixer_impl=legacy`. CPU smoke tests select that legacy architecture explicitly. CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
 
 Checkpoints without `mixer_impl` are treated as legacy. To resume them, explicitly set `model.mixer_impl=legacy`; they cannot initialize or resume an official-Mamba run by renaming keys. Official checkpoints require `--device cuda` for inference, evaluation, benchmarking, and export. CPU/phone execution of that architecture remains future work.
+
+The current model presets also select `model.codec_impl=nemotron_causal`. The author dense encoder consumes log-magnitude and phase, reduces frequency resolution by two, and feeds temporal-then-frequency Mamba blocks. Separate mapped-magnitude and phase decoders replace the earlier complex-residual head. Missing `codec_impl` identifies the earlier codec; select `model.codec_impl=legacy` to load those runs. Codec changes require fresh training and are rejected during checkpoint initialization/resume.
 
 The trainer supports one device or PyTorch DDP for regression and adversarial training. The integration suite exercises two CPU/Gloo processes, gradient accumulation, decoder transitions, checkpoint resume, and comparison with an equivalent single-process batch. CUDA/NCCL correctness, memory use, and scaling still require GPU validation.
 
@@ -136,7 +141,9 @@ python -m realtime_use.train \
   output_dir=runs/fixed4-adversarial
 ```
 
-Here the enhancement network remains trainable, with hinge-GAN and feature-matching losses in addition to clean-reference reconstruction. Inference still uses one enhancement network. Teacher tensors are ignored in this stage. Discriminators and the precise adversarial objective are our implementation choices.
+Install the `gan` extra before this stage. Use matching PyTorch and torchaudio builds; the tested setup is documented in [training.md](docs/training.md#official-mamba-cuda-environment). The default `adversarial.implementation=dac_mrd` imports the original DAC `MRD` at FFT sizes 512, 1024 and 2048, with approximately 4 kHz bands. It does not enable DAC's periodic critics or waveform peak normalization.
+
+Here the enhancement network remains trainable, with hinge-GAN and feature-matching losses in addition to clean-reference reconstruction. Inference still uses one enhancement network. Teacher tensors are ignored in this stage. The DAC critic is a documented approximation to the family cited by RE-USE; the exact real-time critic and loss recipe are not available in the reviewed releases. Legacy critics remain available through `adversarial.implementation=legacy` for older runs.
 
 This follows the real-time paper's broad regression-then-adversarial approach. The offline RE-USE paper instead freezes a regression network and trains a separate residual generator; that two-network inference design is not implemented here. See [method boundaries](docs/method.md).
 
@@ -213,7 +220,7 @@ The benchmark uses synthetic timing input unless `--input` supplies a recording.
 
 ## Measure before scaling
 
-The earlier **legacy mixer** with width 64, expansion 4, and state dimension 16 has these measured active parameter counts. They do not describe the new official-Mamba presets:
+The earlier **legacy codec and mixer** with width 64, expansion 4, and state dimension 16 have these measured active parameter counts. They do not describe the new author-codec/official-Mamba presets:
 
 - Four-block exit: **863,426**.
 - Eight-block exit: **1,687,746**.
@@ -226,12 +233,13 @@ from realtime_use.config import ModelConfig
 from realtime_use.model import Enhancer
 
 model = Enhancer(ModelConfig(depth=12, exits=(4, 8, 12),
-                             mixer_impl="mamba_ssm", scan_backend="auto"))
+                             mixer_impl="mamba_ssm", scan_backend="auto",
+                             codec_impl="nemotron_causal"))
 for depth in model.config.exits:
     print(depth, model.active_parameter_count(depth))
 ```
 
-These are counts for our independent encoder/decoder and are not directly comparable to the paper's reported architecture. The decoder adds a learned complex residual to the noisy spectrum, allowing nonzero predictions in missing input bins. That capability does not establish restoration quality. This baseline retains every frequency bin instead of downsampling frequency; smaller parameter counts therefore do not guarantee lower compute or memory use than the published model.
+The legacy counts above must not be relabeled as the paper's counts or the new model's counts. The new author encoder halves frequency resolution; its separate magnitude/phase heads map directly to a reconstructed spectrum. State memory, compute and quality must be remeasured after this architecture change.
 
 Measure streaming p50/p95/p99 processing time at batch size one on the target machine, including the audio framing path. With a 20 ms hop, sustained processing must fit within 20 ms per hop. The 40 ms analysis window is an algorithmic latency component; audio-device buffering and processing time add to it.
 

@@ -39,6 +39,7 @@ def test_hydra_experiment_composition(tmp_path, experiment, depth, exits):
     assert cfg.model.depth == depth
     assert list(cfg.model.exits) == exits
     assert cfg.model.mixer_impl == "mamba_ssm"
+    assert cfg.model.codec_impl == "nemotron_causal"
     assert cfg.training.split_decoders_at == (50000 if experiment == "flexible12" else None)
 
 
@@ -46,12 +47,12 @@ def tiny_paired_config(tmp_path):
     tmp_path.mkdir(exist_ok=True)
     cfg = config_for(tmp_path / "regression", "flexible12")
     cfg.model.update(sample_rate=800, depth=2, exits=[1,2], width=4, state_dim=2,
-                     expand=1, conv_kernel=2, scan_backend="reference", mixer_impl="legacy")
+                     expand=1, conv_kernel=2, scan_backend="reference", mixer_impl="legacy", codec_impl="legacy")
     cfg.training.update(steps=2, batch_size=2, crop_seconds=0.16, workers=0,
         grad_accum=2, checkpoint_every=1, validate_every=1, validation_batches=1,
         log_every=1, split_decoders_at=1)
     cfg.loss.update(fft_sizes=[16,32], kd=0.5)
-    cfg.adversarial.update(channels=4, scales=1)
+    cfg.adversarial.update(channels=4, scales=1, implementation="legacy")
     cfg.trainer.update(enable_progress_bar=False)
     rows=[]
     for index, length in enumerate([99,128]):

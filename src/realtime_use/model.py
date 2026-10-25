@@ -1,6 +1,6 @@
-"""A new causal time-frequency enhancer with selectable block exits.
+"""Causal enhancement with licensed author components and selectable exits.
 
-This baseline follows the published ideas, not NVIDIA's exact codec or weights.
+The author codec is an explicit adaptation, not a released streaming checkpoint.
 Frequency context is bidirectional within an available frame. Temporal context
 is strictly causal. Parameter counts must be measured for this implementation.
 """
@@ -35,6 +35,7 @@ class CausalFeatureConv(nn.Module):
 class TimeFrequencyBlock(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        self.author_topology = cfg.codec_impl == "nemotron_causal"
         self.frequency_norm = nn.LayerNorm(cfg.width)
         self.time_norm = nn.LayerNorm(cfg.width)
         mixer_type = OfficialMambaMixer if cfg.mixer_impl == "mamba_ssm" else SelectiveMixer
@@ -45,8 +46,18 @@ class TimeFrequencyBlock(nn.Module):
         self.frequency_backward = mixer_type(*mixer_args)
         self.frequency_merge = nn.Linear(2 * cfg.width, cfg.width)
         self.temporal = mixer_type(*mixer_args)
+        if self.author_topology:
+            # OpenMDW Nemotron uses directional residuals, projection, channel
+            # normalization and an outer residual. Keep only the forward
+            # temporal direction for the causal adaptation.
+            self.temporal_projection = nn.Linear(cfg.width, cfg.width)
 
     def _frequency(self, x: Tensor) -> Tensor:
+        if self.author_topology:
+            front = self.frequency_forward(x) + x
+            reverse = x.flip(1)
+            back = (self.frequency_backward(reverse) + reverse).flip(1)
+            return x + self.frequency_norm(self.frequency_merge(torch.cat([front, back], dim=-1)))
         values = self.frequency_norm(x)
         front = self.frequency_forward(values)
         back = self.frequency_backward(values.flip(1)).flip(1)
@@ -54,12 +65,23 @@ class TimeFrequencyBlock(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         batch, time, frequency, channels = x.shape
+        if self.author_topology:
+            temporal = x.permute(0, 2, 1, 3).reshape(batch * frequency, time, channels)
+            temporal = temporal + self.time_norm(self.temporal_projection(self.temporal(temporal) + temporal))
+            x = temporal.reshape(batch, frequency, time, channels).permute(0, 2, 1, 3)
+            return self._frequency(x.reshape(batch * time, frequency, channels)).reshape(
+                batch, time, frequency, channels)
         x = self._frequency(x.reshape(batch * time, frequency, channels)).reshape(batch, time, frequency, channels)
         temporal = self.time_norm(x).permute(0, 2, 1, 3).reshape(batch * frequency, time, channels)
         residual = self.temporal(temporal).reshape(batch, frequency, time, channels).permute(0, 2, 1, 3)
         return x + residual
 
     def step(self, x: Tensor, state: dict | None) -> tuple[Tensor, dict]:
+        if self.author_topology:
+            temporal = x.flatten(0, 1)
+            residual, state = self.temporal.step(temporal, state)
+            x = x + self.time_norm(self.temporal_projection(residual + temporal)).reshape_as(x)
+            return self._frequency(x), state
         x = self._frequency(x)
         residual, state = self.temporal.step(self.time_norm(x).flatten(0, 1), state)
         return x + residual.reshape_as(x), state
@@ -93,17 +115,28 @@ class Enhancer(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = copy.deepcopy(config)
-        self.encoder = CausalFeatureConv(3, config.width)
-        self.encoder_norm = nn.LayerNorm(config.width)
+        if config.codec_impl == "nemotron_causal":
+            from .author_codec import AuthorEncoder
+            self.encoder = AuthorEncoder(config.width)
+            self.encoder_norm = nn.Identity()
+        else:
+            self.encoder = CausalFeatureConv(3, config.width)
+            self.encoder_norm = nn.LayerNorm(config.width)
         self.blocks = nn.ModuleList([TimeFrequencyBlock(config) for _ in range(config.depth)])
-        self.shared_decoder: SpectralDecoder | None = None
+        self.shared_decoder: nn.Module | None = None
         self.decoders = nn.ModuleDict()
         if config.decoder_mode == "shared":
-            self.shared_decoder = SpectralDecoder(config.width)
+            self.shared_decoder = self._new_decoder()
         else:
-            self.decoders.update({str(depth): SpectralDecoder(config.width) for depth in config.exits})
+            self.decoders.update({str(depth): self._new_decoder() for depth in config.exits})
         from .audio import SpectralTransform
         self.transform = SpectralTransform(config.sample_rate, config.window_ms, config.hop_ms)
+
+    def _new_decoder(self) -> nn.Module:
+        if self.config.codec_impl == "nemotron_causal":
+            from .author_codec import AuthorDecoder
+            return AuthorDecoder(self.config.width)
+        return SpectralDecoder(self.config.width)
 
     @staticmethod
     def _features(spectrum: Tensor) -> Tensor:
@@ -117,7 +150,7 @@ class Enhancer(nn.Module):
             raise ValueError(f"Requested exits must be a nonempty unique subset of {self.config.exits}")
         return tuple(sorted(result))
 
-    def _decoder(self, exit_depth: int) -> SpectralDecoder:
+    def _decoder(self, exit_depth: int) -> nn.Module:
         if self.config.decoder_mode == "shared":
             if self.shared_decoder is None:
                 raise RuntimeError("Shared decoder is not initialized")
@@ -128,7 +161,8 @@ class Enhancer(nn.Module):
         if spectrum.ndim != 3 or not spectrum.is_complex() or spectrum.shape[1] == 0:
             raise ValueError("Expected nonempty complex [batch, time, frequency]")
         exits = self._exit_list(exit_depths)
-        x = F.silu(self.encoder_norm(self.encoder(self._features(spectrum))))
+        x = (self.encoder(spectrum) if self.config.codec_impl == "nemotron_causal"
+             else F.silu(self.encoder_norm(self.encoder(self._features(spectrum)))))
         result = {}
         for depth, block in enumerate(self.blocks, 1):
             x = block(x)
@@ -155,7 +189,7 @@ class Enhancer(nn.Module):
     def prepare_decoder_transition(self) -> None:
         """Register both head layouts before a training strategy sets up parameters."""
         if self.shared_decoder is None:
-            self.shared_decoder = SpectralDecoder(self.config.width)
+            self.shared_decoder = self._new_decoder()
         for depth in self.config.exits:
             if str(depth) not in self.decoders:
                 self.decoders[str(depth)] = copy.deepcopy(self.shared_decoder)
@@ -180,8 +214,11 @@ class Enhancer(nn.Module):
             state = {"encoder": None, "blocks": [None] * exit_depth, "decoder": None, "exit_depth": exit_depth, "shape": tuple(frame.shape)}
         if state["exit_depth"] != exit_depth or state["shape"] != tuple(frame.shape):
             raise ValueError("Exit or stream shape changed; reset state before switching")
-        x, encoder = self.encoder.step(self._features(frame), state["encoder"])
-        x = F.silu(self.encoder_norm(x))
+        if self.config.codec_impl == "nemotron_causal":
+            x, encoder = self.encoder.step(frame, state["encoder"])
+        else:
+            x, encoder = self.encoder.step(self._features(frame), state["encoder"])
+            x = F.silu(self.encoder_norm(x))
         block_states = []
         for i in range(exit_depth):
             x, block_state = self.blocks[i].step(x, state["blocks"][i])
