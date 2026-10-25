@@ -129,12 +129,15 @@ def _publish_audio(original: Path, target: Path, row: dict[str, Any], verificati
 
 
 def make_plan(root: Path, manifest: Path, output: Path, role: str,
-              max_items: int | None = None, channel_policy: str = 'reject') -> dict[str, Any]:
+              max_items: int | None = None, channel_policy: str = 'reject',
+              wind_id_scope: str = 'global') -> dict[str, Any]:
     """Validate selected source records without creating or extracting anything."""
     if channel_policy not in ('reject', 'first'):
         raise ValueError('channel_policy must be reject or first')
     if role not in ROLES:
         raise ValueError(f'Unknown source role: {role}')
+    if wind_id_scope not in ('global', 'split') or (wind_id_scope == 'split' and role != 'wind'):
+        raise ValueError('wind_id_scope=split is only valid for independently generated wind pools')
     if max_items is not None and max_items < 1:
         raise ValueError('max_items must be positive')
     root, manifest, output = (p.expanduser().resolve() for p in (root, manifest, output))
@@ -183,9 +186,13 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
             shard = (root / shard_relative).resolve(strict=True)
             if not shard.is_relative_to(root) or not shard.is_file():
                 raise ValueError('Source shard escapes the dataset root or is not a file')
-            # Identity deliberately excludes split, so downstream audits can detect reuse.
+            # Recorded-source identities exclude split to expose leakage. Some
+            # synthetic wind runs restart their counters independently per split.
+            # Opting into split-local IDs preserves raw IDs and waveform hashes.
             uid = f'{source}:{source_id}'
             if role == 'wind':
+                if wind_id_scope == 'split':
+                    uid = f'{source}:{row["split"]}:{source_id}'
                 uid = f'wind_noise:{uid}'
             if uid in seen_ids or (str(shard), member) in seen_members:
                 raise ValueError('Duplicate source identity or archive member in selected records')
@@ -215,7 +222,9 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
                 break
     if not rows:
         raise ValueError('No source records selected')
-    return {'version': 2, 'root': str(root), 'source_manifest': str(manifest),
+    return {'version': 3 if wind_id_scope == 'split' else 2,
+            **({'wind_id_scope': 'split'} if wind_id_scope == 'split' else {}),
+            'root': str(root), 'source_manifest': str(manifest),
             'source_manifest_sha256': file_sha256(manifest), 'output_dir': str(output),
             'role': role, 'source': source_split[0], 'split': source_split[1],
             'max_items': max_items, 'channel_policy': channel_policy, 'selected_count': len(rows),
@@ -309,9 +318,12 @@ def main() -> None:
     parser.add_argument('--max-items', type=int, help='Deterministic first-N subset for readiness checks')
     parser.add_argument('--channel-policy', choices=('reject', 'first'), default='reject',
                         help='Reject multichannel audio, or retain its first channel as mono float WAV')
+    parser.add_argument('--wind-id-scope', choices=('global', 'split'), default='global',
+                        help='Use split only for independently generated wind pools with split-local counters; waveform leakage checks still apply')
     parser.add_argument('--execute', action='store_true', help='Materialize existing source audio; never train')
     args = parser.parse_args()
-    plan = make_plan(args.root, args.manifest, args.output_dir, args.role, args.max_items, args.channel_policy)
+    plan = make_plan(args.root, args.manifest, args.output_dir, args.role, args.max_items,
+                     args.channel_policy, args.wind_id_scope)
     result = materialize(plan) if args.execute else {k: v for k, v in plan.items() if k != 'records'}
     print(json.dumps(result, indent=2))
 

@@ -74,6 +74,30 @@ def test_identical_resume_reuses_verified_files_without_rewriting(tmp_path):
     assert times == {p: p.stat().st_mtime_ns for p in times}
 
 
+def test_generated_wind_split_scope_preserves_raw_ids_and_waveform_hashes(tmp_path):
+    plans = []
+    for split in ('train', 'validation'):
+        root, manifest, original = pool(tmp_path, source='wind', split=split, role='wind', count=1)
+        plan = make_plan(root, manifest, tmp_path / split, 'wind', wind_id_scope='split')
+        materialize(plan)
+        record = json.loads((tmp_path / split / 'records.jsonl').read_text())
+        assert record['source_id'] == original[0]['source_id']
+        assert record['sha256'] == original[0]['sha256']
+        assert record['uid'].startswith('wind_noise:')
+        plans.append(plan)
+    assert plans[0]['records'][0]['uid'] != plans[1]['records'][0]['uid']
+    # Fixture waveforms are identical: namespacing must not hide this evidence.
+    assert plans[0]['records'][0]['sha256'] == plans[1]['records'][0]['sha256']
+    with pytest.raises(ValueError, match='different'):
+        materialize(make_plan(root, manifest, tmp_path / 'validation', 'wind'))
+
+
+def test_split_local_wind_policy_cannot_hide_recorded_speech_ids(tmp_path):
+    root, manifest, _ = pool(tmp_path)
+    with pytest.raises(ValueError, match='independently generated wind'):
+        make_plan(root, manifest, tmp_path / 'out', 'speech', wind_id_scope='split')
+
+
 def test_changed_request_and_corrupt_resumed_audio_are_rejected(tmp_path):
     root, manifest, _ = pool(tmp_path)
     plan = make_plan(root, manifest, tmp_path / 'out', 'speech')

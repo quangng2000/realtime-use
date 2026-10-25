@@ -31,6 +31,36 @@ command resumes verified materialization and rendering; changed requests, input
 hashes or existing conflicting files are rejected. Use a new output directory for
 a changed recipe. The original source archives and download processes are untouched.
 
+`--workers N` runs the official per-utterance renderer in parallel within each
+chunk. `--materialize-workers N` extracts independent source/split groups in
+parallel; each group has its own output directory. Both default to one. Worker
+counts are execution settings recorded in `execution.json`, separate from the
+frozen data recipe. They can change when resuming the same output. Chunk size,
+seeds, source hashes, selection limits, and other recipe changes still require a
+new output. Materialization uses spawned processes with one CPU thread per
+worker and at most N groups in flight. An extraction failure stops those workers
+and leaves verified files available for a subsequent resume.
+
+Choose counts using a representative benchmark on the preparation host: extra
+processes can saturate storage or compete with ongoing downloads. Validation
+chunks still run before training chunks, and validation RIR selection remains
+sequential across chunks. Parallel work preserves source order and metadata
+selection; it does not run any model training.
+
+Parallel preparation owns its process pool from the main thread. SIGTERM waits
+for renderer cleanup (or terminates outstanding materializers) before releasing
+the preparation lock. Restart only after the old process and its children exit.
+Do not launch multiple release drivers against the same output directory.
+
+Use a filesystem with POSIX locking and atomic rename for active preparation
+outputs. Runpod documents that its object-backed Global Volumes lack those
+guarantees and cannot attach to CPU pods; a successful filesystem call alone does
+not establish that guarantee. Prefer local disk or a same-region network volume
+for active preparation, retaining verified archives on persistent storage.
+See [Runpod's Global Volume limitations](https://docs.runpod.io/storage/globalvolume/overview#limitations).
+Checksummed resume verifies saved records and audio, but cannot make an
+object-backed mount provide unsupported filesystem semantics.
+
 For a deliberately limited readiness check, add `--max-speech-per-split 16` and use
 a separate output directory. The report labels this an `explicit_readiness_subset`;
 it never implies that the complete corpus was prepared.
@@ -44,6 +74,10 @@ rehashing entire archive files an extra time.
 An early audit checks source utterances, normalized speaker identities, and
 materialized audio hashes across splits before rendering. Validation renders
 before the larger training split so validation failures surface first.
+The documented synthetic wind generator restarts recording indices per split.
+Only those generated wind IDs receive an explicit split namespace. Other noise
+IDs remain global, and waveform hashes are still compared across all noise and
+wind splits, so renaming generated IDs cannot admit duplicated audio.
 
 Official simulation YAML parameters remain unchanged except local inventory/output
 paths, one realization per utterance, and chunk seeds: the official base seed plus

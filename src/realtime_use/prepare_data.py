@@ -7,20 +7,26 @@ Use a separate preparation environment with the upstream dependencies installed.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-import csv
+from contextlib import contextmanager, nullcontext
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from types import ModuleType
 from typing import Any
 
@@ -326,94 +332,281 @@ def _validate_pair(row: dict[str, Any], frames: int) -> dict[str, str]:
     return hashes
 
 
-def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None = None) -> list[dict[str, Any]]:
-    """Render official metadata using upstream code; useful as a testable adapter."""
+def read_metadata(path: Path) -> list[dict[str, str]]:
+    """Read the pinned generator's raw TSV, which does not use CSV quoting.
+
+    Upstream joins structural columns with tabs and appends unescaped transcript
+    text last. A quote in that text must never consume a following physical row;
+    additional tabs in the final text field belong to the transcript itself.
+    """
+    required = {'id', 'speech_uid', 'speech_sid', 'noise_uid', 'rir_uid',
+                'snr_dB', 'augmentation', 'fs', 'length'}
+    allowed = required | {'noisy_path', 'clean_path', 'noise_path', 'text'}
+    rows, seen = [], set()
+    def without_ending(line):
+        if line.endswith('\n'):
+            line = line[:-1]
+            if line.endswith('\r'):
+                line = line[:-1]
+        return line
+    with Path(path).open(encoding='utf-8', newline='\n') as handle:
+        header = without_ending(handle.readline()).split('\t')
+        if (len(header) != len(set(header)) or not required <= set(header)
+                or set(header) - allowed or ('text' in header and header[-1] != 'text')):
+            raise ValueError(f'{path}: invalid raw URGENT metadata header')
+        for line_number, line in enumerate(handle, 2):
+            fields = without_ending(line).split('\t', maxsplit=len(header) - 1)
+            if len(fields) != len(header):
+                raise ValueError(f'{path}:{line_number}: expected {len(header)} raw TSV fields')
+            row = dict(zip(header, fields))
+            for key, value in row.items():
+                if key == 'text':
+                    if any(ord(character) < 32 and character != '\t' for character in value):
+                        raise ValueError(f'{path}:{line_number}: transcript contains unsupported line/control characters')
+                elif not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+                    raise ValueError(f'{path}:{line_number}: malformed structural field {key}')
+            for key in ('id', 'speech_uid', 'speech_sid', 'noise_uid', 'rir_uid'):
+                if any(character.isspace() for character in row[key]):
+                    raise ValueError(f'{path}:{line_number}: {key} must be one token')
+            if not re.fullmatch(r'fileid_[0-9]+', row['id']) or row['id'] in seen:
+                raise ValueError(f'{path}:{line_number}: invalid or duplicate official sample ID')
+            if any(not re.fullmatch(r'[0-9]+', row[key]) or int(row[key]) <= 0 for key in ('fs', 'length')):
+                raise ValueError(f'{path}:{line_number}: fs and length must be positive integers')
+            try:
+                finite_snr = math.isfinite(float(row['snr_dB']))
+            except ValueError:
+                finite_snr = False
+            if not finite_snr:
+                raise ValueError(f'{path}:{line_number}: snr_dB must be finite')
+            seen.add(row['id'])
+            rows.append(row)
+    return rows
+
+
+def _render_row(plan, module, index, original, mappings, hashes, saved=None, *, validate=True):
+    """Render/validate one disjoint pair; never mutate the shared progress ledger."""
     output = Path(plan['output_dir'])
-    inventory = plan['inventories']
-    mappings = {role: {uid: entry['path'] for uid, entry in entries.items()} for role, entries in inventory.items()}
-    mappings['noise'].update(mappings['wind'])
-    completed = _load_progress(progress_path) if progress_path is not None else {}
-    rows = []
-    hashes = {}
     def source_hash(filename):
         if filename not in hashes:
             hashes[filename] = sha256(Path(filename))
         return hashes[filename]
-    with (output / 'log/meta.tsv').open() as handle:
-        metadata = list(csv.DictReader(handle, delimiter='\t'))
-    for index, original in enumerate(metadata):
-        info = dict(original)
-        rate = int(info['fs'])
-        # Do not trust output paths from TSV; confine writes to this new run.
-        for key, directory in (('noisy_path', 'noisy'), ('clean_path', 'clean')):
-            destination = output / directory / f'{index:09d}.wav'
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if not destination.resolve().is_relative_to(output.resolve()) or destination.is_symlink():
-                raise ValueError('Rendered output paths must remain inside the preparation directory')
-            info[key] = str(destination)
-        rir_id = info['rir_uid']
-        alignment = plan.get('rir_alignment', {}).get('method', 'audited')
-        delay = (plan['provenance']['rir_direct_path_samples'][rir_id][str(rate)]
-                 if rir_id != 'none' and alignment == 'audited' else None)
-        source_hashes = {
-            'source_speech_sha256': source_hash(mappings['speech'][info['speech_uid']]),
-            'source_noise_sha256': source_hash(mappings['noise'][info['noise_uid']]),
-        }
-        rir_hash = source_hash(mappings['rir'][rir_id]) if rir_id != 'none' else None
-        saved = completed.get(index)
-        if saved is not None:
-            if saved['metadata_row_sha256'] != _json_hash(original):
-                raise ValueError(f'Generated metadata changed for completed row {index}')
-            row = saved['row']
-            if (row['noisy'] != info['noisy_path'] or row['clean'] != info['clean_path']
-                    or row['sample_rate'] != rate):
-                raise ValueError(f'Completed row {index} has inconsistent output paths/rate')
-            if any(row.get(key) != value for key, value in source_hashes.items()):
-                raise ValueError(f'Source audio changed since completed row {index}')
-            if rir_hash is not None and row['rir_alignment'].get('source_rir_sha256') != rir_hash:
-                raise ValueError(f'Source RIR changed since completed row {index}')
-            try:
-                reusable = _validate_pair(row, int(info['length'])) == saved['output_sha256']
-            except (OSError, RuntimeError, ValueError):
-                reusable = False
-            if reusable:
-                if rir_id != 'none':
-                    plan.setdefault('rir_alignment_evidence', {}).setdefault(rir_id, {})[str(rate)] = dict(row['rir_alignment'])
-                rows.append(row)
-                continue
-        wind_match = re.search(r'clipping=(True|False)(?:,|\))', info['augmentation'])
-        with rendering_adapters(module, delay=delay, wind_clipping=bool(wind_match and wind_match[1] == 'True'),
-                                rir_alignment=alignment) as alignment_evidence:
-            module.process_one_sample(info, force_1ch=True, store_noise=False,
-                                      speech_dic=mappings['speech'], noise_dic=mappings['noise'], rir_dic=mappings['rir'])
-        row = {'id': f"{plan['provenance']['split']}:{info['id']}",
-               'noisy': info['noisy_path'], 'clean': info['clean_path'], 'sample_rate': rate,
-               'split': plan['provenance']['split'], 'speech_uid': info['speech_uid'],
-               'speaker_id': info['speech_sid'],
-               'noise_uid': info['noise_uid'], 'rir_uid': rir_id,
-               'alignment_delay_samples': alignment_evidence.get('delay_samples', delay or 0),
-               **({'direct_path_delay_samples': delay or 0} if alignment == 'audited' else
-                  {'estimated_onset_delay_samples': alignment_evidence.get('delay_samples', 0)}),
-               'rir_alignment': alignment_evidence if rir_id != 'none' else {'method': 'none', 'delay_samples': 0},
-               'usage': plan.get('usage', 'commercial'),
-               'commercial_clearance': plan.get('commercial_clearance', 'documented'),
-               'augmentation': info['augmentation'], 'target': plan['target'],
-               **({'transcript': info['text']} if info.get('text') not in (None, '<not-available>') else {}),
-               'upstream_commit': URGENT_COMMIT,
-               **source_hashes,
-               'provenance': str(output / 'provenance.json')}
-        if rir_id != 'none':
-            alignment_evidence['source_rir_sha256'] = rir_hash
-            plan.setdefault('rir_alignment_evidence', {}).setdefault(rir_id, {})[str(rate)] = dict(alignment_evidence)
-        if progress_path is not None:
-            record = {'index': index, 'metadata_row_sha256': _json_hash(original),
-                      'row': row, 'output_sha256': _validate_pair(row, int(info['length']))}
-            record['record_sha256'] = _json_hash(record)
+    info = dict(original)
+    rate = int(info['fs'])
+    # Do not trust output paths from TSV; confine writes to this new run.
+    for key, directory in (('noisy_path', 'noisy'), ('clean_path', 'clean')):
+        destination = output / directory / f'{index:09d}.wav'
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.resolve().is_relative_to(output.resolve()) or destination.is_symlink():
+            raise ValueError('Rendered output paths must remain inside the preparation directory')
+        info[key] = str(destination)
+    rir_id = info['rir_uid']
+    alignment = plan.get('rir_alignment', {}).get('method', 'audited')
+    delay = (plan['provenance']['rir_direct_path_samples'][rir_id][str(rate)]
+             if rir_id != 'none' and alignment == 'audited' else None)
+    source_hashes = {
+        'source_speech_sha256': source_hash(mappings['speech'][info['speech_uid']]),
+        'source_noise_sha256': source_hash(mappings['noise'][info['noise_uid']]),
+    }
+    rir_hash = source_hash(mappings['rir'][rir_id]) if rir_id != 'none' else None
+    if saved is not None:
+        if saved['metadata_row_sha256'] != _json_hash(original):
+            raise ValueError(f'Generated metadata changed for completed row {index}')
+        row = saved['row']
+        if (row['noisy'] != info['noisy_path'] or row['clean'] != info['clean_path']
+                or row['sample_rate'] != rate):
+            raise ValueError(f'Completed row {index} has inconsistent output paths/rate')
+        if any(row.get(key) != value for key, value in source_hashes.items()):
+            raise ValueError(f'Source audio changed since completed row {index}')
+        if rir_hash is not None and row['rir_alignment'].get('source_rir_sha256') != rir_hash:
+            raise ValueError(f'Source RIR changed since completed row {index}')
+        try:
+            reusable = _validate_pair(row, int(info['length'])) == saved['output_sha256']
+        except (OSError, RuntimeError, ValueError):
+            reusable = False
+        if reusable:
+            return row, None
+    wind_match = re.search(r'clipping=(True|False)(?:,|\))', info['augmentation'])
+    with rendering_adapters(module, delay=delay, wind_clipping=bool(wind_match and wind_match[1] == 'True'),
+                            rir_alignment=alignment) as alignment_evidence:
+        module.process_one_sample(info, force_1ch=True, store_noise=False,
+                                  speech_dic=mappings['speech'], noise_dic=mappings['noise'], rir_dic=mappings['rir'])
+    row = {'id': f"{plan['provenance']['split']}:{info['id']}",
+           'noisy': info['noisy_path'], 'clean': info['clean_path'], 'sample_rate': rate,
+           'split': plan['provenance']['split'], 'speech_uid': info['speech_uid'],
+           'speaker_id': info['speech_sid'],
+           'noise_uid': info['noise_uid'], 'rir_uid': rir_id,
+           'alignment_delay_samples': alignment_evidence.get('delay_samples', delay or 0),
+           **({'direct_path_delay_samples': delay or 0} if alignment == 'audited' else
+              {'estimated_onset_delay_samples': alignment_evidence.get('delay_samples', 0)}),
+           'rir_alignment': alignment_evidence if rir_id != 'none' else {'method': 'none', 'delay_samples': 0},
+           'usage': plan.get('usage', 'commercial'),
+           'commercial_clearance': plan.get('commercial_clearance', 'documented'),
+           'augmentation': info['augmentation'], 'target': plan['target'],
+           **({'transcript': info['text']} if info.get('text') not in (None, '<not-available>') else {}),
+           'upstream_commit': URGENT_COMMIT,
+           **source_hashes,
+           'provenance': str(output / 'provenance.json')}
+    if rir_id != 'none':
+        alignment_evidence['source_rir_sha256'] = rir_hash
+    record = None
+    if validate:
+        record = {'index': index, 'metadata_row_sha256': _json_hash(original),
+                  'row': row, 'output_sha256': _validate_pair(row, int(info['length']))}
+        record['record_sha256'] = _json_hash(record)
+    return row, record
+
+
+_RENDER_WORKER = None
+
+
+def _render_worker_init(plan, scratch):
+    """Spawn initializer: one official module and isolated wind workspace per CPU worker."""
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    verify_source(Path(plan['source']))
+    module = load_simulator(Path(plan['source']))
+    mappings = {role: {uid: entry['path'] for uid, entry in entries.items()}
+                for role, entries in plan['inventories'].items()}
+    mappings['noise'].update(mappings['wind'])
+    directory = tempfile.mkdtemp(prefix=f'worker-{os.getpid()}-', dir=scratch)
+    os.chdir(directory)
+    global _RENDER_WORKER
+    _RENDER_WORKER = plan, module, mappings, {}
+
+
+def _render_worker_task(task):
+    plan, module, mappings, hashes = _RENDER_WORKER
+    index, original, saved, validate = task
+    row, record = _render_row(plan, module, index, original, mappings, hashes, saved, validate=validate)
+    return row, record, os.getpid()
+
+
+@contextmanager
+def _spawn_cpu_environment():
+    # Spawned imports see these limits before NumPy/Torch initialize native
+    # pools. Restore the caller's environment after all children have exited.
+    values = {name: '1' for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
+                                    'MKL_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS',
+                                    'NUMEXPR_NUM_THREADS')}
+    values['CUDA_VISIBLE_DEVICES'] = ''
+    previous = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@contextmanager
+def _graceful_sigterm():
+    """Unwind a multiprocessing owner before releasing its output lock.
+
+    SIGTERM normally skips Python finally blocks. Convert the first signal to
+    SystemExit, then ignore repeats while executor shutdown joins the children.
+    This does not make SIGKILL safe. Only the main thread may own signal handlers.
+    Nested preparation contexts keep the outer handler installed through cleanup.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError('Multiprocess preparation must run on the main thread for graceful SIGTERM cleanup')
+    previous = signal.getsignal(signal.SIGTERM)
+    if getattr(previous, '_realtime_use_graceful_sigterm', False):
+        yield
+        return
+    def terminate(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+    terminate._realtime_use_graceful_sigterm = True
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _worker_count(workers):
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError('workers must be a positive integer')
+    return workers
+
+
+def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None = None,
+                    workers: int = 1, execution: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Render official metadata with bounded CPU work and an ordered parent ledger.
+
+    Worker count is execution policy, not a recipe setting: it may change on
+    resume without changing any sampled augmentation parameters or output IDs.
+    Audio stays in files; only metadata, hashes and alignment evidence cross IPC.
+    """
+    workers = _worker_count(workers)
+    output = Path(plan['output_dir'])
+    mappings = {role: {uid: entry['path'] for uid, entry in entries.items()}
+                for role, entries in plan['inventories'].items()}
+    mappings['noise'].update(mappings['wind'])
+    completed = _load_progress(progress_path) if progress_path is not None else {}
+    metadata = read_metadata(output / 'log/meta.tsv')
+    if any(index >= len(metadata) for index in completed):
+        raise ValueError('Preparation progress refers to metadata rows that do not exist')
+    rows = []
+    stats = execution if execution is not None else {}
+    stats.update(workers=workers, worker_pids=[], rendered=0, reused=0, max_in_flight=0)
+    def commit(result):
+        row, record = result[:2]
+        pid = result[2] if len(result) == 3 else os.getpid()
+        if pid not in stats['worker_pids']:
+            stats['worker_pids'].append(pid)
+        stats['reused' if record is None and progress_path is not None else 'rendered'] += 1
+        if row['rir_uid'] != 'none':
+            plan.setdefault('rir_alignment_evidence', {}).setdefault(row['rir_uid'], {})[
+                str(row['sample_rate'])] = dict(row['rir_alignment'])
+        if progress_path is not None and record is not None:
             with progress_path.open('a') as handle:
                 handle.write(json.dumps(record) + '\n')
                 handle.flush()
                 os.fsync(handle.fileno())
         rows.append(row)
+
+    if workers == 1:
+        hashes = {}
+        for index, original in enumerate(metadata):
+            commit(_render_row(plan, module, index, original, mappings, hashes,
+                               completed.get(index), validate=progress_path is not None))
+        return rows
+    if not metadata:
+        return rows
+    # Transient FFmpeg/wind files stay on local temporary storage, even when
+    # final pairs live on a remote filesystem. Each child has a separate cwd.
+    # Bounded submission also bounds completed results waiting behind a slower
+    # earlier row. Metadata-order commit keeps journals/manifests deterministic.
+    worker_plan = {key: value for key, value in plan.items() if key != 'rir_alignment_evidence'}
+    with _graceful_sigterm(), _spawn_cpu_environment(), tempfile.TemporaryDirectory(prefix='realtime-use-render-') as scratch:
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
+                                   initializer=_render_worker_init, initargs=(worker_plan, scratch))
+        tasks = iter(enumerate(metadata))
+        pending = deque()
+        try:
+            def submit_one():
+                item = next(tasks, None)
+                if item is None:
+                    return False
+                index, original = item
+                task = (index, original, completed.get(index), progress_path is not None)
+                pending.append(pool.submit(_render_worker_task, task))
+                stats['max_in_flight'] = max(stats['max_in_flight'], len(pending))
+                return True
+            for _ in range(min(len(metadata), 2 * workers)):
+                submit_one()
+            while pending:
+                commit(pending.popleft().result())
+                submit_one()
+        finally:
+            # Only a bounded amount of uncommitted work can complete on failure.
+            # Such files are deliberately re-rendered on the next resume.
+            pool.shutdown(wait=True, cancel_futures=True)
     return rows
 
 
@@ -534,7 +727,7 @@ def _ensure_metadata(plan: dict[str, Any]) -> Path:
     return metadata_path
 
 
-def _execute_locked(plan: dict[str, Any], module, *, resume: bool) -> Path:
+def _execute_locked(plan: dict[str, Any], module, *, resume: bool, workers: int = 1) -> Path:
     output = Path(plan['output_dir'])
     plan_path = output / 'plan.json'
     config_path = output / 'simulation.yaml'
@@ -567,7 +760,10 @@ def _execute_locked(plan: dict[str, Any], module, *, resume: bool) -> Path:
     previous_directory = Path.cwd()
     try:
         os.chdir(output)  # upstream wind temporary WAVs stay inside this run
-        rows = render_metadata(plan, module, progress_path=output / 'render-progress.jsonl')
+        render_started = time.monotonic()
+        execution = {}
+        rows = render_metadata(plan, module, progress_path=output / 'render-progress.jsonl', workers=workers, execution=execution)
+        render_seconds = time.monotonic() - render_started
     finally:
         os.chdir(previous_directory)
     if not rows:
@@ -587,12 +783,16 @@ def _execute_locked(plan: dict[str, Any], module, *, resume: bool) -> Path:
                     additive_noise=sum(not row['noise_uid'].startswith('wind_noise') for row in rows))
     _atomic_json(output / 'provenance.json', {**plan, 'runtime_versions': versions,
         'metadata_sha256': sha256(metadata_path), 'progress_sha256': sha256(output / 'render-progress.jsonl'),
-        'manifest_sha256': sha256(manifest), 'realized_degradation_counts': coverage, 'examples': len(rows)})
+        'manifest_sha256': sha256(manifest), 'realized_degradation_counts': coverage, 'examples': len(rows),
+        'render_execution': {**execution, 'start_method': 'spawn' if workers > 1 else 'in_process',
+                             'numeric_threads_per_worker': 1 if workers > 1 else None,
+                             'render_and_resume_validation_seconds': render_seconds}})
     return manifest.replace(final_manifest)
 
 
-def execute_preparation(plan: dict[str, Any], *, resume: bool = False) -> Path:
+def execute_preparation(plan: dict[str, Any], *, resume: bool = False, workers: int = 1) -> Path:
     """Prepare only; explicit resume reuses verified rows under the identical plan."""
+    workers = _worker_count(workers)
     source, output = Path(plan['source']), Path(plan['output_dir'])
     verify_source(source)
     if output.exists() and not resume:
@@ -614,13 +814,14 @@ def execute_preparation(plan: dict[str, Any], *, resume: bool = False) -> Path:
     # Preparation hosts are Linux/macOS. An advisory lock is released by the OS
     # even after abrupt process termination; no stale PID files need bypassing.
     import fcntl
-    with (output / '.preparation.lock').open('a') as lock:
+    signal_guard = _graceful_sigterm() if workers > 1 else nullcontext()
+    with signal_guard, (output / '.preparation.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError('Another process is preparing this output directory') from exc
         try:
-            return _execute_locked(plan, module, resume=resume)
+            return _execute_locked(plan, module, resume=resume, workers=workers)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -663,6 +864,7 @@ def main() -> None:
         prepare.add_argument(f'--{flag}', type=Path, required=True)
     prepare.add_argument('--execute', action='store_true', help='Render local inputs; default prints plan only')
     prepare.add_argument('--resume', action='store_true', help='With --execute, reuse only verified rows under the identical saved plan')
+    prepare.add_argument('--workers', type=int, default=1, help='CPU rendering processes; may change on resume without changing the recipe')
     prepare.add_argument('--usage', choices=('commercial', 'research'), default='commercial',
                          help='Research preserves pending rights review; it does not establish permission')
     prepare.add_argument('--rir-alignment', choices=('audited', 'upstream-estimated-onset'), default='audited',
@@ -677,7 +879,9 @@ def main() -> None:
                                 usage=args.usage, rir_alignment=args.rir_alignment)
         if args.resume and not args.execute:
             parser.error('--resume requires --execute')
-        print(execute_preparation(plan, resume=args.resume) if args.execute else json.dumps(plan, indent=2))
+        if args.workers < 1:
+            parser.error('--workers must be a positive integer')
+        print(execute_preparation(plan, resume=args.resume, workers=args.workers) if args.execute else json.dumps(plan, indent=2))
 
 
 if __name__ == '__main__':

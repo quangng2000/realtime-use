@@ -35,3 +35,10 @@ Tar contents are read in bounded blocks and never extracted by archive-provided 
 Pass the resulting `source.scp` files to `speech_scps`, `noise_scps`, `rir_scps`, and `wind_noise_scps` in the simulator YAML. Match each speech SCP with its `utt2spk`, and optionally its `text`. Corpus/source UIDs deliberately omit the split: this preserves cross-split identity for the final leakage audit. Speaker IDs are retained unchanged except for MLS: its raw numeric speaker IDs can collide between languages, so emitted mappings use `mls:<language>:<raw-speaker>`, with language read from `mls_<language>_<utterance>` source IDs. Original raw speaker metadata is retained separately from `materialized_speaker_id`. No split label is added to speaker namespaces, so a reused speaker still triggers the final cross-split audit. Other acquisition pipelines must namespace speakers consistently across corpora and retain the same ID across splits.
 
 Materialization does not invent `commercial_use:true`, license evidence, or audited RIR direct-path delays. Supply those records separately under the preparation route's selected permission policy. Native-rate audio coverage, source split design, RIR timing, and the official simulator environment still need validation before rendering paired manifests. Run `prepare_data audit-splits` on the generated train/validation manifests before use.
+
+Independently generated wind pools may restart their filename counters for each
+split. For those pools only, explicit `--wind-id-scope split` namespaces the
+generated UID by split while preserving the raw source ID and waveform hashes.
+The release bridge selects this policy for the recorded SC-Wind-Noise-Generator
+source. Identical train/validation waveform hashes still fail the leakage audit.
+Recorded speech and noise retain global source identities.

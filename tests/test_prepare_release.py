@@ -71,10 +71,11 @@ def fixture_release(tmp_path, monkeypatch):
 
 def fake_renderer(monkeypatch):
     calls = []
-    def execute(plan, *, resume=False):
+    def execute(plan, *, resume=False, workers=1):
         assert resume is True
         output = Path(plan['output_dir'])
         calls.append(plan)
+        execute.worker_counts.append(workers)
         if (output / 'manifest.jsonl').exists():
             assert json.loads((output / 'test-plan.json').read_text()) == json.loads(json.dumps(plan))
             return output / 'manifest.jsonl'
@@ -96,6 +97,7 @@ def fake_renderer(monkeypatch):
         manifest = output / 'manifest.jsonl'
         manifest.write_text(''.join(json.dumps(row) + '\n' for row in rows))
         return manifest
+    execute.worker_counts = []
     monkeypatch.setattr(release.prep, 'execute_preparation', execute)
     return calls, execute
 
@@ -148,10 +150,10 @@ def test_pipeline_materializes_renders_audits_and_resumes_without_rewriting_audi
 def test_interrupted_chunk_does_not_publish_final_manifests_and_can_resume(tmp_path, monkeypatch):
     root, source = fixture_release(tmp_path, monkeypatch)
     _, renderer = fake_renderer(monkeypatch)
-    def interrupt(plan, *, resume=False):
+    def interrupt(plan, *, resume=False, workers=1):
         if plan['provenance']['split'] == 'validation' and plan['chunk']['index'] == 1:
             raise RuntimeError('simulated interruption')
-        return renderer(plan, resume=resume)
+        return renderer(plan, resume=resume, workers=workers)
     monkeypatch.setattr(release.prep, 'execute_preparation', interrupt)
     plan = release.release_plan(root, source, tmp_path / 'out', chunk_size=1)
     with pytest.raises(RuntimeError, match='interruption'):
@@ -176,8 +178,8 @@ def test_changed_subset_request_rejected_in_existing_output(tmp_path, monkeypatc
 def test_split_leakage_prevents_ready_publication(tmp_path, monkeypatch):
     root, source = fixture_release(tmp_path, monkeypatch)
     _, renderer = fake_renderer(monkeypatch)
-    def leak(plan, *, resume=False):
-        path = renderer(plan, resume=resume)
+    def leak(plan, *, resume=False, workers=1):
+        path = renderer(plan, resume=resume, workers=workers)
         records = list(release._rows(path))
         for row in records:
             row['speaker_id'] = 'shared-across-splits'
@@ -195,7 +197,7 @@ def test_ready_is_invalidated_before_resume_repairs_and_republished_after_succes
     _, renderer = fake_renderer(monkeypatch)
     plan = release.release_plan(root, source, tmp_path / 'out', chunk_size=1)
     first = release.execute_release(plan)
-    def interrupted_repair(chunk, *, resume=False):
+    def interrupted_repair(chunk, *, resume=False, workers=1):
         assert not (tmp_path / 'out/READY.json').exists()
         raise RuntimeError('repair interrupted')
     monkeypatch.setattr(release.prep, 'execute_preparation', interrupted_repair)
@@ -252,3 +254,123 @@ def test_validation_rir_rate_exhaustion_fails_before_training_render(tmp_path, m
     with pytest.raises(ValueError, match='no remaining eligible source at or above 16000'):
         release.execute_release(release.release_plan(root, source, tmp_path / 'out', chunk_size=1))
     assert calls == []
+
+
+def refresh_artifacts(root):
+    """Re-publish the generated fixture after intentionally changing its inputs."""
+    paths = list((root / 'sources').glob('*/SOURCE_READY.json')) + [root / 'release/RELEASE.json']
+    for path in paths:
+        document = json.loads(path.read_text())
+        for artifact in document['artifacts']:
+            target = root / artifact['path']
+            artifact.update(bytes=target.stat().st_size, sha256=release.prep.sha256(target))
+        path.write_text(json.dumps(document))
+
+
+def rewrite_index(root, name, change):
+    path = root / 'release' / f'{name}.jsonl'
+    rows = list(release._rows(path))
+    for row in rows:
+        change(row)
+    value = ''.join(json.dumps(row) + '\n' for row in rows)
+    path.write_text(value)
+    (root / 'sources' / rows[0]['source'] / f'{rows[0]["split"]}.jsonl').write_text(value)
+    refresh_artifacts(root)
+
+
+def test_parallel_materialization_and_worker_count_resume_keep_recipe_and_audio(tmp_path, monkeypatch):
+    root, source = fixture_release(tmp_path, monkeypatch)
+    _, renderer = fake_renderer(monkeypatch)
+    plan = release.release_plan(root, source, tmp_path / 'out', chunk_size=1)
+    first = release.execute_release(plan, workers=3, materialize_workers=2)
+    request = (tmp_path / 'out/request.json').read_bytes()
+    manifests = {split: Path(item['path']).read_bytes() for split, item in first['manifests'].items()}
+    audio = list((tmp_path / 'out/materialized').glob('*/audio/*'))
+    mtimes = {path: path.stat().st_mtime_ns for path in audio}
+    assert renderer.worker_counts == [3] * 6
+    assert release.execute_release(plan, workers=1, materialize_workers=3) == first
+    assert (tmp_path / 'out/request.json').read_bytes() == request
+    assert {path: path.stat().st_mtime_ns for path in audio} == mtimes
+    assert {split: Path(item['path']).read_bytes() for split, item in first['manifests'].items()} == manifests
+    settings = json.loads((tmp_path / 'out/execution.json').read_text())
+    assert settings['render_workers'] == 1 and settings['materialize_workers'] == 3
+    assert 'workers' not in json.loads(request)
+
+
+def test_pre_parallel_default_global_request_resumes_without_identity_migration(tmp_path, monkeypatch):
+    root, source = fixture_release(tmp_path, monkeypatch)
+    _, renderer = fake_renderer(monkeypatch)
+    output = tmp_path / 'out'
+    plan = release.release_plan(root, source, output, chunk_size=1)
+    # A request from before parallelism has no execution counts or explicit
+    # default wind scope. Reconstruct those historical fields independently.
+    legacy = deepcopy(plan)
+    for group in legacy['groups'].values():
+        group.pop('wind_id_scope', None)
+    assert plan == legacy
+    output.mkdir()
+    original = release._json(legacy).encode()
+    (output / 'request.json').write_bytes(original)
+    result = release.execute_release(plan, workers=2, materialize_workers=2)
+    assert result['training_pairs_ready'] is True
+    assert (output / 'request.json').read_bytes() == original
+    assert renderer.worker_counts == [2] * 6
+    wind_groups = [g for g in plan['groups'].values() if g['role'] == 'wind']
+    assert all('wind_id_scope' not in group for group in wind_groups)
+
+
+def test_parallel_materialization_failure_stops_workers_without_rendering(tmp_path, monkeypatch):
+    import multiprocessing
+    root, source = fixture_release(tmp_path, monkeypatch)
+    calls, _ = fake_renderer(monkeypatch)
+    rewrite_index(root, 'speech_train', lambda row: row.update(sha256='0' * 64))
+    plan = release.release_plan(root, source, tmp_path / 'out', chunk_size=1)
+    existing = {process.pid for process in multiprocessing.active_children()}
+    with pytest.raises(ValueError, match='checksum mismatch'):
+        release.execute_release(plan, materialize_workers=2)
+    assert calls == []
+    assert not (tmp_path / 'out/READY.json').exists()
+    assert not (tmp_path / 'out/manifests/train.jsonl').exists()
+    assert {process.pid for process in multiprocessing.active_children()} <= existing
+
+
+@pytest.mark.parametrize('field,value', [('workers', 0), ('workers', True), ('materialize_workers', -1),
+                                         ('materialize_workers', 1.5)])
+def test_invalid_worker_count_does_not_change_ready_release(tmp_path, monkeypatch, field, value):
+    root, source = fixture_release(tmp_path, monkeypatch)
+    fake_renderer(monkeypatch)
+    plan = release.release_plan(root, source, tmp_path / 'out')
+    release.execute_release(plan)
+    ready = (tmp_path / 'out/READY.json').read_bytes()
+    with pytest.raises(ValueError, match='positive integer'):
+        release.execute_release(plan, **{field: value})
+    assert (tmp_path / 'out/READY.json').read_bytes() == ready
+
+
+@pytest.mark.parametrize('duplicate_audio', [False, True])
+def test_documented_generated_wind_ids_are_split_scoped_but_hashes_are_audited(tmp_path, monkeypatch, duplicate_audio):
+    root, source = fixture_release(tmp_path, monkeypatch)
+    calls, _ = fake_renderer(monkeypatch)
+    for split in ('train', 'validation'):
+        rewrite_index(root, f'wind_{split}', lambda row: row.update(
+            source_id='wind_noise_8000hz_0',
+            license='Generated using MIT-licensed SC-Wind-Noise-Generator'))
+    if duplicate_audio:
+        train = next(release._rows(root / 'release/wind_train.jsonl'))
+        validation = next(release._rows(root / 'release/wind_validation.jsonl'))
+        with tarfile.open(root / train['shard']) as archive:
+            raw = archive.extractfile(train['path']).read()
+        with tarfile.open(root / validation['shard'], 'w') as archive:
+            member = tarfile.TarInfo(validation['path'])
+            member.size = len(raw)
+            archive.addfile(member, io.BytesIO(raw))
+        rewrite_index(root, 'wind_validation', lambda row: row.update(
+            sha256=train['sha256'], frames=train['frames']))
+    plan = release.release_plan(root, source, tmp_path / 'out')
+    assert {g['wind_id_scope'] for g in plan['groups'].values() if g['role'] == 'wind'} == {'split'}
+    if duplicate_audio:
+        with pytest.raises(ValueError, match='Early split leakage: noise_materialized_sha256'):
+            release.execute_release(plan)
+        assert calls == []
+    else:
+        assert release.execute_release(plan)['training_pairs_ready'] is True

@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -160,6 +163,13 @@ def release_plan(root: Path, source: Path, output: Path, *, chunk_size: int = 10
     for group in groups.values():
         group['sample_rates'].sort()
         group['licenses'].sort()
+        # The official synthetic generator restarts its index separately for
+        # train/validation. Scope only those documented generated wind IDs;
+        # physical recordings retain global identity and all hashes are audited.
+        if group['role'] == 'wind' and group['licenses'] == ['Generated using MIT-licensed SC-Wind-Noise-Generator']:
+            group['wind_id_scope'] = 'split'
+        # Absence means the historical global identity policy. Do not add a
+        # default key that would invalidate otherwise identical old requests.
     return {'format_version': 1, 'root': str(root), 'source': str(source), 'output_dir': str(output),
             'source_commit': prep.URGENT_COMMIT, 'release_sha256': prep.sha256(release_path),
             'source_release_status': release['status'], 'incomplete_sources': release.get('failed_or_incomplete_sources', {}),
@@ -211,6 +221,113 @@ def _partition(plan: dict[str, Any]) -> dict[str, Path]:
 def _progress(output: Path, **values) -> None:
     _write(output / 'progress.json', _json(values), immutable=False)
     print(json.dumps(values), flush=True)
+
+
+def _worker_count(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f'{name} must be a positive integer')
+    return value
+
+
+@contextmanager
+def _single_threaded_children():
+    """Set limits before spawn imports NumPy/Torch, then restore the parent."""
+    names = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS')
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update({name: '1' for name in names})
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _materialization_worker_init() -> None:
+    # The preparation module imports Torch for independent loader validation.
+    # These workers do audio I/O only; prevent nested CPU thread pools.
+    import torch
+    torch.set_num_threads(1)
+
+
+def _materialize_group(root: str, path: str, output: str, role: str,
+                       wind_id_scope: str) -> dict[str, Any]:
+    return bridge.materialize(bridge.make_plan(Path(root), Path(path), Path(output), role,
+                                              channel_policy='first', wind_id_scope=wind_id_scope))
+
+
+def _abort_materializers(executor: ProcessPoolExecutor, pending) -> None:
+    for future in pending:
+        future.cancel()
+    # Python 3.14 exposes terminate_workers; 3.11-3.13 do not. Capture the
+    # executor-owned process handles before shutdown, so a failed group does
+    # not leave unrelated corpus-sized extraction jobs running in the background.
+    if hasattr(executor, 'terminate_workers'):
+        executor.terminate_workers()
+        return
+    processes = list((getattr(executor, '_processes', None) or {}).values())
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _materialize_groups(plan, partitions, workers: int):
+    """Bound in-flight jobs to workers and retain deterministic corpus order."""
+    output = Path(plan['output_dir'])
+    completed = {}
+
+    def task(key, path):
+        return (plan['root'], str(path), str(output / 'materialized' / key),
+                plan['groups'][key]['role'], plan['groups'][key].get('wind_id_scope', 'global'))
+
+    if workers == 1:
+        for index, (key, path) in enumerate(partitions.items()):
+            _progress(output, stage='materializing', group=key, completed_groups=index,
+                      total_groups=len(partitions), materialize_workers=1)
+            completed[key] = _materialize_group(*task(key, path))
+        return completed
+
+    iterator = iter(partitions.items())
+    with _single_threaded_children(), prep._graceful_sigterm():
+        executor = ProcessPoolExecutor(max_workers=min(workers, len(partitions)),
+            mp_context=multiprocessing.get_context('spawn'), initializer=_materialization_worker_init)
+        pending = {}
+        try:
+            for _ in range(min(workers, len(partitions))):
+                key, path = next(iterator)
+                pending[executor.submit(_materialize_group, *task(key, path))] = key
+            _progress(output, stage='materializing', active_groups=list(pending.values()),
+                      completed_groups=0, total_groups=len(partitions), materialize_workers=workers)
+            while pending:
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Observe every result before starting more work: if one failed,
+                # no new group is launched merely because a peer completed too.
+                for future in finished:
+                    key = pending.pop(future)
+                    completed[key] = future.result()
+                for _ in finished:
+                    following = next(iterator, None)
+                    if following is not None:
+                        key, path = following
+                        pending[executor.submit(_materialize_group, *task(key, path))] = key
+                _progress(output, stage='materializing', active_groups=list(pending.values()),
+                          completed_groups=len(completed), total_groups=len(partitions),
+                          materialize_workers=workers)
+        except BaseException:
+            _abort_materializers(executor, pending)
+            raise
+        else:
+            executor.shutdown(wait=True)
+    # Completion order must not change SCP order, seeds, or resume plan hashes.
+    return {key: completed[key] for key in partitions}
 
 
 def _invalidate_ready(output: Path) -> None:
@@ -348,7 +465,10 @@ def _combine(manifests: list[Path], destination: Path, split: str) -> int:
     return counts[0]
 
 
-def execute_release(plan: dict[str, Any]) -> dict[str, Any]:
+def execute_release(plan: dict[str, Any], *, workers: int = 1,
+                    materialize_workers: int = 1) -> dict[str, Any]:
+    workers = _worker_count(workers, 'workers')
+    materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
     output = Path(plan['output_dir'])
     # Revalidate the exact frozen request, including all finalized input hashes.
     current = release_plan(Path(plan['root']), Path(plan['source']), output,
@@ -360,13 +480,14 @@ def execute_release(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError('Existing output lacks a matching preparation request')
     _write(output / 'request.json', _json(plan))
     _invalidate_ready(output)
+    # Concurrency is operational state, not part of the frozen data recipe.
+    # Recording it separately lets a resumed job change its CPU allocation.
+    _write(output / 'execution.json', _json({'render_workers': workers,
+        'materialize_workers': materialize_workers, 'process_start_method': 'spawn',
+        'training_started': False}), immutable=False)
     _progress(output, stage='partitioning', selection=plan['selection_scope'], selected_counts=plan['selected_counts'])
     partitions = _partition(plan)
-    materialized = {}
-    for index, (key, path) in enumerate(partitions.items()):
-        _progress(output, stage='materializing', group=key, completed_groups=index, total_groups=len(partitions))
-        materialized[key] = bridge.materialize(bridge.make_plan(Path(plan['root']), path,
-            output / 'materialized' / key, plan['groups'][key]['role'], channel_policy='first'))
+    materialized = _materialize_groups(plan, partitions, materialize_workers)
     _progress(output, stage='auditing_materialized_sources')
     source_audit = audit_materialized_sources(plan, materialized)
     _write(output / 'source-split-audit.json', _json(source_audit))
@@ -382,7 +503,7 @@ def execute_release(plan: dict[str, Any]) -> dict[str, Any]:
             _progress(output, stage='rendering', split=split, chunk=index,
                       completed_speech=start, total_speech=len(speech))
             chunk = _chunk_plan(base, selected, index, output, used_rirs)
-            manifest = prep.execute_preparation(chunk, resume=True)
+            manifest = prep.execute_preparation(chunk, resume=True, workers=workers)
             observed = set()
             for row in _rows(manifest):
                 observed.add(row['speech_uid'])
@@ -429,6 +550,10 @@ def main() -> None:
     parser.add_argument('--source', type=Path, required=True, help='Pristine pinned official URGENT checkout')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--chunk-size', type=int, default=1024)
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Parallel official renderer processes per chunk; runtime setting, not a recipe change')
+    parser.add_argument('--materialize-workers', type=int, default=1,
+                        help='Parallel independent source-group extraction processes; runtime setting, not a recipe change')
     parser.add_argument('--usage', choices=('research',), default='research',
                         help='This release route retains pending permission evidence; commercial preparation uses the audited adapter separately')
     parser.add_argument('--rir-alignment', choices=('upstream-estimated-onset',), default='upstream-estimated-onset')
@@ -436,9 +561,12 @@ def main() -> None:
     parser.add_argument('--validation-reuse-rir', action='store_true', help='Explicitly permit validation RIR reuse; changes the official validation recipe')
     parser.add_argument('--execute', action='store_true', help='Prepare local audio and paired manifests; never train')
     args = parser.parse_args()
+    _worker_count(args.workers, 'workers')
+    _worker_count(args.materialize_workers, 'materialize_workers')
     plan = release_plan(args.root, args.source, args.output_dir, chunk_size=args.chunk_size,
                         max_speech_per_split=args.max_speech_per_split, validation_reuse_rir=args.validation_reuse_rir)
-    print(_json(execute_release(plan) if args.execute else plan))
+    print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers)
+                if args.execute else plan))
 
 
 if __name__ == '__main__':

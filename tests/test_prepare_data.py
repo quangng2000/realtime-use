@@ -428,3 +428,59 @@ def test_resume_repairs_missing_mirror_from_atomic_generation_marker(tmp_path, m
     assert counts['generate'] == 1
     assert len(counts['render']) == 2
     assert json.loads((output / 'metadata.json').read_text())['sha256'] == prep.sha256(output / 'log/meta.tsv')
+
+
+def test_raw_metadata_quotes_and_tabs_do_not_swallow_following_utterances(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, 'verify_source', lambda path: None)
+    config, provenance = input_files(tmp_path)
+    output = tmp_path / 'quoted-output'
+    plan = prep.preparation_plan(tmp_path, config, provenance, output)
+    (output / 'log').mkdir(parents=True)
+    header = ['id', 'noisy_path', 'speech_uid', 'speech_sid', 'clean_path', 'noise_uid',
+              'snr_dB', 'rir_uid', 'augmentation', 'fs', 'length', 'text']
+    transcripts = ['"An opening quote, a tab\tand no closing quote',
+                   'The next utterance ends with a quote."', '"A complete quoted utterance."']
+    expected = [dict(zip(header, [f'fileid_{index}', '/ignored/noisy.wav', 'speech',
+        'local-speaker', '/ignored/clean.wav', 'noise', '5', 'none', 'none', '8000', '80', text]))
+        for index, text in enumerate(transcripts)]
+    metadata = output / 'log/meta.tsv'
+    # Match the actual upstream writer: raw tab joins, no CSV escaping.
+    metadata.write_text('\t'.join(header) + '\n' + ''.join(
+        '\t'.join(row[key] for key in header) + '\n' for row in expected))
+    assert prep.read_metadata(metadata) == expected
+    called = []
+    module = SimpleNamespace(estimate_early_rir=lambda value: value,
+                             wind_noise=lambda *args: None, save_audio=lambda *args: None,
+                             process_one_sample=lambda info, **kwargs: called.append(info['id']))
+    rows = prep.render_metadata(plan, module)
+    assert called == ['fileid_0', 'fileid_1', 'fileid_2']
+    assert [row['transcript'] for row in rows] == transcripts
+    assert [row['speech_uid'] for row in rows] == ['speech'] * 3
+
+
+@pytest.mark.parametrize('malformed', ['duplicate_header', 'text_not_last', 'missing_field',
+    'extra_structural_tab', 'bad_rate', 'bad_length', 'nonfinite_snr', 'duplicate_id', 'invalid_id'])
+def test_raw_metadata_rejects_malformed_structural_rows(tmp_path, malformed):
+    header = ['id', 'speech_uid', 'speech_sid', 'noise_uid', 'rir_uid', 'snr_dB', 'augmentation', 'fs', 'length']
+    fields = ['fileid_1', 'speech', 'speaker', 'noise', 'none', '5', 'none', '8000', '80']
+    if malformed == 'duplicate_header':
+        header.append('id'); fields.append('fileid_2')
+    elif malformed == 'text_not_last':
+        header.insert(0, 'text'); fields.insert(0, 'transcript')
+    elif malformed == 'missing_field':
+        fields.pop()
+    elif malformed == 'extra_structural_tab':
+        fields[-1] += '\textra'
+    elif malformed == 'bad_rate':
+        fields[-2] = '8000.0'
+    elif malformed == 'bad_length':
+        fields[-1] = '0'
+    elif malformed == 'nonfinite_snr':
+        fields[5] = 'nan'
+    elif malformed == 'invalid_id':
+        fields[0] = 'arbitrary_sample'
+    row = '\t'.join(fields) + '\n'
+    metadata = tmp_path / 'bad.tsv'
+    metadata.write_text('\t'.join(header) + '\n' + row + (row if malformed == 'duplicate_id' else ''))
+    with pytest.raises(ValueError):
+        prep.read_metadata(metadata)
