@@ -107,3 +107,67 @@ def test_actual_official_codec_and_wind_preflight(official, tmp_path, kind):
     assert np.isfinite(noisy).all()
     gain = np.dot(clean, speech) / np.dot(speech, speech)
     np.testing.assert_allclose(clean, gain * speech, atol=1e-7)
+
+
+def test_actual_onset_estimator_uses_same_resampled_rir_as_renderer(official, tmp_path):
+    rate, count = 16000, 3200
+    speech = .1 * np.sin(2 * np.pi * 300 * np.arange(count) / rate)
+    noise = np.random.default_rng(6).normal(0, .02, count)
+    rir = np.zeros(768); rir[111] = .4; rir[351] = 1
+    for name, wave, fs in [('speech', speech, rate), ('noise', noise, rate), ('rir', rir, 48000)]:
+        sf.write(tmp_path / f'{name}.wav', wave, fs, subtype='FLOAT')
+    rendered_rir = official.read_audio(str(tmp_path/'rir.wav'), force_1ch=True, fs=rate)[0]
+    expected = int(official._realtime_use_rir_onset(rendered_rir[0], level_ratio=.1))
+    info = dict(id='fileid_3', fs=rate, snr_dB=10, speech_uid='speech', noise_uid='noise',
+                rir_uid='rir', length=count, augmentation='none',
+                clean_path=str(tmp_path/'clean.wav'), noisy_path=str(tmp_path/'noisy.wav'))
+    with prep.rendering_adapters(official, delay=None, wind_clipping=False,
+                                 rir_alignment='upstream-estimated-onset') as evidence:
+        official.process_one_sample(info, speech_dic={'speech': str(tmp_path/'speech.wav')},
+            noise_dic={'noise': str(tmp_path/'noise.wav')}, rir_dic={'rir': str(tmp_path/'rir.wav')})
+    clean, _ = sf.read(tmp_path/'clean.wav')
+    delayed = np.pad(speech, (expected, 0))[:count]
+    gain = np.dot(clean, delayed) / np.dot(delayed, delayed)
+    np.testing.assert_allclose(clean, gain * delayed, atol=1e-7)
+    assert evidence['sample_rate'] == rate
+    assert evidence['delay_samples'] == expected
+    assert evidence['rendered_rir_frames'] == rendered_rir.shape[-1]
+    assert evidence['physical_direct_path_audited'] is False
+
+
+
+def test_actual_generator_retry_preserves_random_draws(official, tmp_path, monkeypatch):
+    import yaml
+    source = Path(os.environ['REALTIME_USE_URGENT_SOURCE'])
+    config = yaml.safe_load((source / 'conf/simulation_train.yaml').read_text())
+    rate = 16000
+    for field, role in prep.ROLES.items():
+        wave = np.random.default_rng(20).normal(0, .01, rate)
+        audio = tmp_path / f'{role}.wav'
+        sf.write(audio, wave, rate, subtype='FLOAT')
+        uid = 'wind_noise_1' if role == 'wind' else role
+        scp = tmp_path / f'{role}.scp'
+        scp.write_text(f'{uid} {rate} {audio}\n')
+        config[field] = [str(scp)]
+    speakers = tmp_path / 'speakers'
+    speakers.write_text('speech speaker_1\n')
+    config.update(speech_utt2spk=[str(speakers)], speech_text=[],
+                  num_augmentations={0: 1.0}, seed=73, repeat_per_utt=4)
+    output = tmp_path / 'prepared'
+    output.mkdir()
+    config.update(output_dir=str(output), log_dir=str(output / 'log'))
+    plan = {'source': str(source), 'output_dir': str(output), 'config': config}
+    real_run = prep.subprocess.run
+    expected = {}
+    def interrupt(*args, **kwargs):
+        real_run(*args, **kwargs)
+        staged = output / '.metadata-generation/log/meta.tsv'
+        expected['bytes'] = staged.read_bytes()
+        staged.write_bytes(expected['bytes'][:50])
+        raise RuntimeError('simulated generator exit before commit')
+    monkeypatch.setattr(prep.subprocess, 'run', interrupt)
+    with pytest.raises(RuntimeError, match='before commit'):
+        prep._ensure_metadata(plan)
+    monkeypatch.setattr(prep.subprocess, 'run', real_run)
+    meta = prep._ensure_metadata(plan)
+    assert meta.read_bytes() == expected['bytes']

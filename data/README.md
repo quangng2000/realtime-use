@@ -2,6 +2,8 @@
 
 The training loader consumes permitted, aligned mono pairs. It does not download datasets, estimate alignment, downmix, or silently resample them. Keep real audio and generated data outside Git. The optional official preparation adapter runs separately from training.
 
+Downloaded source archives are not paired manifests. See [source materialization](../docs/source-materialization.md) for verified extraction and [release preparation](../docs/release-preparation.md) for the resumable source-release → official simulator → train/validation manifest workflow. These commands perform data preparation only; they never launch training.
+
 ## Paired manifests
 
 Use one JSON object per line. Audio paths resolve relative to the manifest unless absolute:
@@ -71,6 +73,10 @@ A provenance JSON accompanies the simulation YAML:
 
 These permission fields are the dataset owner's attestation, not automatic license verification. The simulator's code license does not grant rights to its listed corpora. The adapter rejects absent permission records and explicitly noncommercial licenses. Keep split construction and licenses in the project provenance ledger.
 
+Those permission checks describe the default `--usage commercial` route. For an existing research dataset whose commercial clearance is pending, explicit `--usage research` preserves its licenses, evidence, and `commercial_use` values without asserting clearance. The research output remains labeled accordingly; preparing it does not change the rights attached to the source recordings.
+
+When a research RIR corpus has no audited arrival labels, explicit `--rir-alignment upstream-estimated-onset` uses the pinned official `get_rir_start_sample` on the exact mono/resampled RIR used for convolution. It records the 10%-of-peak onset estimate, rendering rate, source/rendered RIR hashes, and `physical_direct_path_audited: false`. The target remains a delayed anechoic signal, but the delay is an estimate rather than a verified physical arrival. The default `audited` mode still requires the supplied direct-path map.
+
 Inspect a plan first; this validates local inventories but does not render audio:
 
 ```bash
@@ -82,6 +88,8 @@ python -m realtime_use.prepare_data urgent \
 ```
 
 Add `--execute` to that command only when ready to prepare the local inputs. This runs parameter generation and then rendering, never training. Existing output directories are rejected. Results include `manifest.jsonl`, generated float WAV pairs, official `log/meta.tsv`, resolved simulation YAML, provenance/source hashes, package versions, and realized degradation counts. Rendering is sequential; independent split/shard jobs can be run in distinct output directories. The manifest is published only after all pairs pass decoding, finite-sample, rate and length checks.
+
+After interruption, add `--resume` with the identical inputs and settings. The adapter verifies the saved plan and generated metadata, then reuses only completed pairs whose hashes and decoded audio still validate. Incomplete pairs are rendered again. The final manifest is published only after the full chunk passes. Source-release preparation splits large speech inventories into such chunks and audits the combined train/validation manifests before publishing its readiness record.
 
 Two narrow upstream wind fixes are recorded in the adapter: parse the literal clipping flag rather than treating the string `"False"` as true, and pass a copy of speech into the upstream in-place gain routine so it cannot alter the clean target. Float WAV output avoids extra PCM16 target quantization. These adaptations mean this is an official-simulator integration with anechoic targets, not byte-for-byte Challenge audio reproduction.
 

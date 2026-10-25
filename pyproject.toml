@@ -24,6 +24,8 @@ dependencies = [
 realtime-use-train = "realtime_use.train:main"
 realtime-use-preflight = "realtime_use.preflight:main"
 realtime-use-prepare-data = "realtime_use.prepare_data:main"
+realtime-use-materialize-sources = "realtime_use.materialize_sources:main"
+realtime-use-prepare-release = "realtime_use.prepare_release:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]

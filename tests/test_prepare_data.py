@@ -1,6 +1,7 @@
 """Simulator-adapter tests use generated tiny audio; no training or real data."""
 import csv
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -136,3 +137,294 @@ assert "g2p_en" not in sys.modules
 assert "simulate_data_from_param" not in sys.modules
 '''
     subprocess.run([sys.executable, '-c', code], check=True, capture_output=True)
+
+
+def test_research_mode_preserves_pending_permissions_without_claiming_clearance(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, 'verify_source', lambda path: None)
+    config, provenance = input_files(tmp_path)
+    record = json.loads(provenance.read_text())
+    record['sources'][0].update(commercial_use=None, license='CC-BY-NC-4.0')
+    record.pop('rir_direct_path_samples')
+    provenance.write_text(json.dumps(record))
+    plan = prep.preparation_plan(tmp_path, config, provenance, tmp_path / 'output',
+                                 usage='research', rir_alignment='upstream-estimated-onset')
+    assert plan['usage'] == 'research'
+    assert plan['commercial_clearance'] == 'pending'
+    assert plan['provenance']['sources'][0]['commercial_use'] is None
+    assert plan['rir_alignment']['physical_direct_path_audited'] is False
+    assert 'estimated_onset' in plan['target']
+    assert 'rir_direct_path_samples' not in plan['provenance']
+    assert not (tmp_path / 'output').exists()
+    with pytest.raises(ValueError, match='commercial-use'):
+        prep.preparation_plan(tmp_path, config, provenance, tmp_path / 'other',
+                              rir_alignment='upstream-estimated-onset')
+    with pytest.raises(ValueError, match='audited direct-path'):
+        prep.preparation_plan(tmp_path, config, provenance, tmp_path / 'other', usage='research')
+    record['sources'][0]['license_evidence'] = ''
+    provenance.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match='license evidence'):
+        prep.preparation_plan(tmp_path, config, provenance, tmp_path / 'other',
+                              usage='research', rir_alignment='upstream-estimated-onset')
+
+
+def test_estimated_onset_records_actual_rendered_rir_and_is_not_a_physical_audit():
+    received = {}
+    rir = np.array([[0., .01, .2, 1., .5]], dtype=np.float32)
+    def estimator(wave, level_ratio):
+        received.update(wave=wave.copy(), level_ratio=level_ratio)
+        return 2
+    module = SimpleNamespace(estimate_early_rir=lambda value: value,
+                             wind_noise=lambda *args: None, save_audio=lambda *args: None,
+                             _realtime_use_rir_onset=estimator)
+    with prep.rendering_adapters(module, delay=None, wind_clipping=False,
+                                 rir_alignment='upstream-estimated-onset') as evidence:
+        impulse = module.estimate_early_rir(rir, fs=8000)
+    np.testing.assert_array_equal(received['wave'], rir[0])
+    np.testing.assert_array_equal(impulse, [[0, 0, 1, 0, 0]])
+    assert received['level_ratio'] == .1
+    assert evidence['sample_rate'] == 8000
+    assert evidence['delay_samples'] == 2
+    assert evidence['physical_direct_path_audited'] is False
+    assert len(evidence['rendered_rir_sha256']) == 64
+    for invalid in (np.zeros((1, 4)), np.full((1, 4), np.nan), np.ones((2, 4))):
+        with prep.rendering_adapters(module, delay=None, wind_clipping=False,
+                                     rir_alignment='upstream-estimated-onset'):
+            with pytest.raises(ValueError, match='nonzero mono'):
+                module.estimate_early_rir(invalid, fs=8000)
+
+
+def test_estimated_manifest_does_not_mislabel_delay_as_audited(tmp_path, monkeypatch):
+    monkeypatch.setattr(prep, 'verify_source', lambda path: None)
+    config, provenance = input_files(tmp_path)
+    output = tmp_path / 'output'
+    plan = prep.preparation_plan(tmp_path, config, provenance, output,
+                                 usage='research', rir_alignment='upstream-estimated-onset')
+    (output / 'log').mkdir(parents=True)
+    row = dict(id='fileid_1', fs=8000, length=80, snr_dB=5, speech_uid='speech',
+               speech_sid='local-speaker', noise_uid='noise', rir_uid='rir', augmentation='none')
+    with (output / 'log/meta.tsv').open('w') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row), delimiter='\t')
+        writer.writeheader(); writer.writerow(row)
+    module = SimpleNamespace(estimate_early_rir=lambda value: value,
+                             wind_noise=lambda *args: None, save_audio=lambda *args: None,
+                             _realtime_use_rir_onset=lambda wave, level_ratio: 2)
+    def process(info, **kwargs):
+        module.estimate_early_rir(np.array([[0., 0., 1., .5]]), fs=int(info['fs']))
+    module.process_one_sample = process
+    rows = prep.render_metadata(plan, module)
+    assert rows[0]['estimated_onset_delay_samples'] == 2
+    assert 'direct_path_delay_samples' not in rows[0]
+    assert rows[0]['usage'] == 'research'
+    assert rows[0]['commercial_clearance'] == 'pending'
+    assert rows[0]['rir_alignment']['physical_direct_path_audited'] is False
+    evidence = plan['rir_alignment_evidence']['rir']['8000']
+    assert evidence['source_rir_sha256'] == prep.sha256(tmp_path / 'rir.wav')
+    assert evidence['rendered_rir_frames'] == 4
+
+
+
+def resumable_execution(tmp_path, monkeypatch):
+    """A two-row simulator fixture that exercises the real persistence path."""
+    monkeypatch.setattr(prep, 'verify_source', lambda path: None)
+    monkeypatch.setattr(prep.shutil, 'which', lambda name: '/test/ffmpeg')
+    monkeypatch.setattr(prep.importlib.metadata, 'version', lambda name: '202509' if name == 'espnet' else 'test-version')
+    config, provenance = input_files(tmp_path)
+    output = tmp_path / 'output'
+    plan = prep.preparation_plan(tmp_path, config, provenance, output)
+    counts = {'generate': 0, 'render': []}
+    def generate(*args, **kwargs):
+        counts['generate'] += 1
+        rows = [dict(id=f'fileid_{i}', fs=8000, length=80, snr_dB=5,
+                     speech_uid='speech', speech_sid='local-speaker', noise_uid='noise',
+                     rir_uid='none', augmentation='none') for i in range(2)]
+        command = args[0]
+        config_path = Path(command[command.index('--config') + 1])
+        log_dir = Path(yaml.safe_load(config_path.read_text())['log_dir'])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / 'meta.tsv').open('w') as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter='\t')
+            writer.writeheader(); writer.writerows(rows)
+    monkeypatch.setattr(prep.subprocess, 'run', generate)
+    module = SimpleNamespace(estimate_early_rir=lambda value: value,
+                             wind_noise=lambda *args: None, save_audio=lambda *args: None)
+    def process(info, **kwargs):
+        counts['render'].append(info['id'])
+        wave = np.linspace(-.1, .1, int(info['length']))
+        sf.write(info['noisy_path'], wave * .5, int(info['fs']), subtype='FLOAT')
+        sf.write(info['clean_path'], wave, int(info['fs']), subtype='FLOAT')
+    module.process_one_sample = process
+    monkeypatch.setattr(prep, 'load_simulator', lambda source: module)
+    return plan, output, module, counts
+
+
+def test_resume_recovers_completed_rows_and_rerenders_interrupted_pair(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    normal = module.process_one_sample
+    def interrupt_second(info, **kwargs):
+        normal(info, **kwargs)
+        if info['id'] == 'fileid_1':
+            raise RuntimeError('simulated interruption before recording success')
+    module.process_one_sample = interrupt_second
+    with pytest.raises(RuntimeError, match='simulated interruption'):
+        prep.execute_preparation(plan)
+    assert not (output / 'manifest.jsonl').exists()
+    ledger = output / 'render-progress.jsonl'
+    assert len(ledger.read_text().splitlines()) == 1
+    # A torn last ledger write and existing waveform files do not count as success.
+    with ledger.open('a') as handle:
+        handle.write('{"index":')
+    module.process_one_sample = normal
+    manifest = prep.execute_preparation(plan, resume=True)
+    assert counts == {'generate': 1, 'render': ['fileid_0', 'fileid_1', 'fileid_1']}
+    assert len(manifest.read_text().splitlines()) == 2
+    report = json.loads((output / 'provenance.json').read_text())
+    assert report['manifest_sha256'] == prep.sha256(manifest)
+    assert report['progress_sha256'] == prep.sha256(ledger)
+    assert report['metadata_sha256'] == prep.sha256(output / 'log/meta.tsv')
+    with pytest.raises(FileExistsError):
+        prep.execute_preparation(plan)
+
+
+def test_resume_validates_saved_pairs_and_rebuilds_corrupt_audio(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    manifest = prep.execute_preparation(plan)
+    original = manifest.read_bytes()
+    sf.write(output / 'clean/000000000.wav', np.zeros(80), 8000, subtype='FLOAT')
+    prep.execute_preparation(plan, resume=True)
+    assert counts['generate'] == 1
+    assert counts['render'] == ['fileid_0', 'fileid_1', 'fileid_0']
+    assert manifest.read_bytes() == original
+    # A complete second resume performs validation but no rendering/generation.
+    prep.execute_preparation(plan, resume=True)
+    assert len(counts['render']) == 3
+
+
+def test_resume_refuses_changed_plan_metadata_or_source_audio(tmp_path, monkeypatch):
+    from copy import deepcopy
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    manifest = prep.execute_preparation(plan)
+    changed = deepcopy(plan)
+    changed['config']['seed'] = 99
+    with pytest.raises(ValueError, match='same saved preparation plan'):
+        prep.execute_preparation(changed, resume=True)
+    assert manifest.is_file()
+    meta = output / 'log/meta.tsv'
+    original = meta.read_bytes()
+    meta.write_bytes(original + b'\n')
+    with pytest.raises(ValueError, match='committed checksum'):
+        prep.execute_preparation(plan, resume=True)
+    assert counts['generate'] == 1
+    meta.write_bytes(original)
+    sf.write(tmp_path / 'speech.wav', np.zeros(80), 8000, subtype='FLOAT')
+    with pytest.raises(ValueError, match='Source audio changed'):
+        prep.execute_preparation(plan, resume=True)
+    assert not manifest.exists()
+    assert (output / 'manifest.previous.jsonl').exists()
+
+
+def test_resume_does_not_trust_uncommitted_existing_generation(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    prep.execute_preparation(plan)
+    (output / 'metadata.json').unlink()
+    (output / 'log/generation-complete.json').unlink()
+    with pytest.raises(ValueError, match='will not be regenerated or trusted'):
+        prep.execute_preparation(plan, resume=True)
+    assert counts['generate'] == 1
+
+
+def test_resume_restores_only_verified_estimated_alignment_evidence(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    plan['rir_alignment'] = {'method': 'upstream-estimated-onset'}
+    original_generate = prep.subprocess.run
+    def generate(*args, **kwargs):
+        original_generate(*args, **kwargs)
+        command = args[0]
+        config_path = Path(command[command.index('--config') + 1])
+        meta = Path(yaml.safe_load(config_path.read_text())['log_dir']) / 'meta.tsv'
+        with meta.open() as handle:
+            rows = list(csv.DictReader(handle, delimiter='\t'))
+        with meta.open('w') as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter='\t')
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({**row, 'rir_uid': 'rir'})
+    monkeypatch.setattr(prep.subprocess, 'run', generate)
+    original_process = module.process_one_sample
+    def process(info, **kwargs):
+        module.estimate_early_rir(np.array([[0., 0., 1., .5]]), fs=int(info['fs']))
+        original_process(info, **kwargs)
+    module.process_one_sample = process
+    module._realtime_use_rir_onset = lambda wave, level_ratio: 2
+    prep.execute_preparation(plan)
+    expected = plan['rir_alignment_evidence']
+    # Evidence is execution output; it is rebuilt from verified records, not
+    # trusted from a caller's possibly stale in-memory plan.
+    plan['rir_alignment_evidence'] = {'unused': {'8000': {'delay_samples': 99}}}
+    prep.execute_preparation(plan, resume=True)
+    assert len(counts['render']) == 2
+    assert plan['rir_alignment_evidence'] == expected
+    assert plan['rir_alignment_evidence']['rir']['8000']['delay_samples'] == 2
+
+
+def test_progress_rejects_corrupt_committed_line(tmp_path):
+    path = tmp_path / 'progress.jsonl'
+    path.write_text('{"index": 0, "record_sha256": "wrong"}\n')
+    with pytest.raises(ValueError, match='Corrupt preparation progress'):
+        prep._load_progress(path)
+
+
+
+def test_resume_restarts_only_uncommitted_interrupted_generation(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    original_generate = prep.subprocess.run
+    expected = {}
+    def interrupted_generation(*args, **kwargs):
+        original_generate(*args, **kwargs)
+        command = args[0]
+        config_path = Path(command[command.index('--config') + 1])
+        log_dir = Path(yaml.safe_load(config_path.read_text())['log_dir'])
+        meta = log_dir / 'meta.tsv'
+        expected['complete'] = meta.read_bytes()
+        meta.write_bytes(expected['complete'][:50])
+        raise RuntimeError('generator interrupted before completion')
+    monkeypatch.setattr(prep.subprocess, 'run', interrupted_generation)
+    with pytest.raises(RuntimeError, match='generator interrupted'):
+        prep.execute_preparation(plan)
+    assert not (output / 'log/meta.tsv').exists()
+    assert not (output / 'metadata.json').exists()
+    assert counts['render'] == []
+    monkeypatch.setattr(prep.subprocess, 'run', original_generate)
+    manifest = prep.execute_preparation(plan, resume=True)
+    assert manifest.exists()
+    assert (output / 'log/meta.tsv').read_bytes() == expected['complete']
+    assert counts['generate'] == 2
+    assert list(output.glob('.metadata-interrupted-*'))
+
+
+def test_resume_recovers_completed_generation_before_promotion(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    original_json = prep._atomic_json
+    def interrupt_after_completion(path, value):
+        original_json(path, value)
+        if path.name == 'generation-complete.json':
+            raise RuntimeError('interrupted after generation commit')
+    monkeypatch.setattr(prep, '_atomic_json', interrupt_after_completion)
+    with pytest.raises(RuntimeError, match='after generation commit'):
+        prep.execute_preparation(plan)
+    staged = output / '.metadata-generation/log/meta.tsv'
+    expected = staged.read_bytes()
+    assert not (output / 'log/meta.tsv').exists()
+    monkeypatch.setattr(prep, '_atomic_json', original_json)
+    prep.execute_preparation(plan, resume=True)
+    assert counts['generate'] == 1
+    assert (output / 'log/meta.tsv').read_bytes() == expected
+
+
+def test_resume_repairs_missing_mirror_from_atomic_generation_marker(tmp_path, monkeypatch):
+    plan, output, module, counts = resumable_execution(tmp_path, monkeypatch)
+    prep.execute_preparation(plan)
+    (output / 'metadata.json').unlink()
+    prep.execute_preparation(plan, resume=True)
+    assert counts['generate'] == 1
+    assert len(counts['render']) == 2
+    assert json.loads((output / 'metadata.json').read_text())['sha256'] == prep.sha256(output / 'log/meta.tsv')
