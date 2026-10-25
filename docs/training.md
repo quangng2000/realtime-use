@@ -1,18 +1,18 @@
 # Training with Lightning and Hydra
 
-Training uses a LightningModule, an aligned-audio LightningDataModule, and Hydra configuration composition. The model, losses, and method limitations described in [method.md](method.md) are unchanged by this orchestration choice.
+Training uses a LightningModule, an aligned-audio LightningDataModule, and Hydra configuration composition. See [method.md](method.md) for architecture, framing, objective and reproduction boundaries. No training or optimizer updates were launched for the current parity update; commands in this document are instructions for future runs.
 
 ## Library responsibilities and project-specific code
 
-Hydra composes configurations and launches independent sweeps. Lightning owns process setup, optimizer and loop restoration, precision handling, CSV logging, and checkpoint selection and serialization. Two native `ModelCheckpoint` callbacks manage periodic snapshots and the lowest validation loss; the project does not maintain a separate best-score tracker.
+Hydra composes configurations and launches independent sweeps. Lightning owns process setup, optimizer and loop restoration, precision handling, CSV logging, and checkpoint selection and serialization. Two native `ModelCheckpoint` callbacks manage periodic snapshots and selection by the configured validation metric; the project does not maintain a separate best-score tracker.
 
-New model presets use official Mamba-1 and the licensed NVIDIA dense encoder/magnitude/phase decoder components adapted for causality. GAN presets import DAC's spectral discriminator. PyTorch supplies STFT/iSTFT and waveform L1, `auraloss` supplies multi-resolution spectral losses, TorchMetrics supplies validation means and signal-quality formulas, and optional `audiomentations` transforms supply training corruptions. Project adapters handle causal state, valid utterance lengths, paired-data semantics, and exit selection. Legacy components remain available for existing checkpoints; they are not the default Hydra training recipe.
+New model presets use official Mamba-1 and the licensed NVIDIA dense encoder/magnitude/phase decoder components adapted for causality. GAN presets import DAC's spectral discriminator. PyTorch supplies STFT/iSTFT and waveform L1, `auraloss` supplies multi-resolution spectral losses, TorchMetrics supplies validation means and signal-quality formulas, and optional `audiomentations` transforms supply training corruptions. Project adapters handle causal state, valid utterance lengths, paired-data semantics, and rate/exit/lookahead selection. Legacy components remain available for existing checkpoints; they are not the default Hydra training recipe.
 
-`loss.implementation=auraloss` uses centered Hann STFTs with hop sizes one quarter of each configured FFT size, spectral-convergence and log-magnitude weights of one, and no phase/perceptual term. Valid utterance prefixes are evaluated separately so batch composition and DDP sharding do not alter their relative weights. Very short prefixes receive deterministic zero extension for the library's reflection padding. This objective differs from the previous uncentered custom loss. Resume must preserve the checkpoint's `model.mixer_impl`, `model.codec_impl`, `loss.implementation` and `adversarial.implementation`; missing identity fields mean legacy. Runs from before the library migration use all legacy components, while runs from the intermediate Mamba migration may use official Mamba with the legacy codec. Inspect the saved configuration rather than switching all fields blindly. `init_from` can deliberately start a new objective/critic with compatible enhancement architecture and fresh optimizer state; it cannot convert codec or mixer weights.
+`loss.implementation=auraloss` uses centered Hann STFTs with hop sizes one quarter of each configured FFT size, spectral-convergence and log-magnitude weights of one, and no phase/perceptual term. Valid utterance prefixes are evaluated separately so batch composition and DDP sharding do not alter their relative weights. Very short prefixes receive deterministic zero extension for the library's reflection padding. This objective differs from the previous uncentered custom loss. When `loss.sample_rate_scaling=true`, FFT sizes are scaled from `model.sample_rate` to the batch rate and rounded to the nearest integer, including odd lengths. Resume must preserve architecture and objective identity, including the mixer, codec, rates, branches, window, loss and critic configuration. Missing implementation identity fields mean legacy; missing new framing fields mean singleton rate, zero lookahead and square-root Hann. Runs from before the library migration use all legacy components, while runs from the intermediate Mamba migration may use official Mamba with the legacy codec. Inspect the saved configuration rather than switching all fields blindly. `init_from` can deliberately start a new objective/critic with compatible enhancement architecture and fresh optimizer state; it cannot convert codec or mixer weights.
 
 The remaining checkpoint adapter checks that manual gradient accumulation has finished before delegating a periodic save. A small run callback writes the resolved configuration, rejects accidental reuse of an existing run, signals the generator-update budget, and refreshes `last.ckpt` on every rank before distributed teardown. Signaling the budget also lets Lightning run any final validation inside `fit`, including when the budget is not a validation-interval multiple.
 
-Model-specific code still defines the causal enhancement network, losses, two-optimizer GAN update, decoder transition, synchronized exit sampling, and valid-example accounting for distributed validation. These are project implementation choices; using Lightning does not establish equivalence to the papers or add missing data augmentation.
+Model-specific code still defines the causal enhancement network, losses, two-optimizer GAN update, decoder transition, synchronized exit/lookahead sampling, and valid-example accounting for distributed validation. These are project implementation choices; using Lightning does not establish equivalence to the papers or add missing data augmentation.
 
 ## Official Mamba CUDA environment
 
@@ -38,23 +38,25 @@ The CUDA extra also pins `transformers==4.57.6`: Mamba's [generation utility](ht
 
 For the complete Linux CPU test suite, first install matching CPU wheels (`python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu`), then `python -m pip install -e ".[test,augmentation,gan]"`. CI uses this combination. The author codec and actual DAC tests execute on CPU with explicitly selected reference mixers; official Mamba numerical tests require CUDA. Do not install the CUDA extra for CPU smoke tests. Smoke selects the legacy codec, reference mixer and legacy critic; it does not exercise the new architecture.
 
-The `gan` extra pins `descript-audio-codec==1.0.0` and `descript-audiotools==0.7.2`. Install torchaudio alongside the matching PyTorch build: dependency resolution alone does not guarantee matching extension binaries. The adapter uses DAC's `MRD` directly, avoiding the enclosing wrapper's periodic critics and amplitude normalization. `adversarial.fft_sizes` and `adversarial.band_width_hz` select STFT scales and approximate band width; `channels` and `scales` apply only to the legacy critic.
+The `gan` extra pins `descript-audio-codec==1.0.0` and `descript-audiotools==0.7.2`. Install torchaudio alongside the matching PyTorch build: dependency resolution alone does not guarantee matching extension binaries. The adapter uses DAC's `MRD` directly, avoiding the enclosing wrapper's periodic critics and amplitude normalization. `adversarial.fft_sizes` and `adversarial.band_width_hz` select reference-rate STFT scales and approximate band width. `adversarial.sample_rate_scaling=true` adapts FFT sizes to each native rate, registers the complete maximum-rate band set before DDP setup, and reuses corresponding lower-band weights across rates. This remains a DAC-based substitute for the unpublished exact critic. `channels` and `scales` apply only to the legacy critic.
 
 Official Mamba checkpoints require `--device cuda` for inference, evaluation, benchmarking, and exit export. Loading one on CPU raises an error rather than changing its architecture. Export retains the chosen official Mamba blocks and verifies full/stream outputs on the requested CUDA device. Legacy checkpoints keep their original parameter layout and CPU reference support; they cannot initialize the official architecture through a backend switch.
 
-Run `python -m pytest -q tests/test_official_mamba.py` on that CUDA host before a training job. These tests exercise the actual class, gradients, streaming state, exit export, and regression/GAN checkpoint continuation. Without CUDA, numerical tests are skipped; on a CUDA host, missing or broken Mamba dependencies fail instead of passing through a mock.
+For tests that do not execute an optimizer or training loop, run `python -m pytest -q --no-training tests/test_official_mamba.py` on that CUDA host. These checks exercise the actual class, gradients, streaming state and export. The marked lifecycle test is skipped because it runs regression/GAN optimizer updates; execute it only when training execution is intended. Without CUDA, numerical tests are skipped; on a CUDA host, missing or broken Mamba dependencies fail instead of passing through a mock. The new architecture/rate/branch contracts are also tested in `tests/test_multirate_lookahead.py`, using explicit CPU reference mixers without optimizer updates.
 
 ## Configuration groups
 
-Canonical configs are packaged under `src/realtime_use/conf`, so the installed command can compose them outside the repository root. The groups are:
+Canonical configs are packaged under `src/realtime_use/conf`, so the installed command can compose them outside the repository root. Configuration groups and their top-level sections include:
 
-- `model`: audio framing, depth, exits, dimensions, decoder mode, codec/mixer implementations, and legacy scan backend.
+- `model`: default/supported sample rates, window type and timing, lookahead branches, depth/exits, dimensions, decoder mode, codec/mixer implementations, and legacy scan backend.
 - `data`: training/validation manifests and data-loading options.
 - `training`: stage, generator-update budget, batch/crop/worker settings, optimizer settings, accumulation, and decoder transition.
 - `loss`: supervised reconstruction and optional cached-output distillation.
 - `adversarial`: critic implementation, STFT scales/bands (or legacy size), and adversarial/feature-matching weights.
 - `trainer`: Lightning accelerator, devices, precision, and runtime options.
-- `experiment`: the composed `fixed4`, `fixed8`, `fixed12`, or `flexible12` starting recipe.
+- `validation`: checkpoint monitor, requested quality metrics, and validation lookahead selection.
+- `validation.quality`: explicit local assets and adapter configuration for optional quality metrics.
+- `experiment`: `fixed4`, `fixed8`, `fixed12`, `flexible12`, or `paper_flexible12`.
 
 Inspect a fully resolved configuration without training:
 
@@ -76,6 +78,56 @@ python -m realtime_use.train \
 ```
 
 The training driver resolves manifest paths against the launch directory. Audio paths inside a manifest remain relative to that manifest. Use absolute manifest/checkpoint paths when scripting sweeps or running from another directory.
+
+## Multi-rate, lookahead and selection profile
+
+`experiment=paper_flexible12` selects all seven supported rates, lookahead branches 0/1/2 and exits 4/8/12. It enables `training.sample_exit=true`, `training.sample_lookahead=true`, `loss.sample_rate_scaling=true`, and `adversarial.sample_rate_scaling=true`. Fixed-rate baseline presets remain singleton-rate and zero-lookahead. New presets use ordinary Hann; old checkpoints missing `window_type` keep square-root Hann.
+
+The paper profile sets `data.validation_full_utterance=true` and `training.validation_batches=null` for a complete validation pass. `validation.lookaheads=null` selects every configured branch; validation evaluates every configured exit. Global equal-utterance means are accumulated for each setting, then settings are averaged equally. The requested 4/8/12 exits create nine exit/lookahead settings, rather than the paper's complete thirty.
+
+`validation.monitor=utmos` and `validation.metrics=[utmos]` select the original UTMOS22 strong learner. Supply local assets through `validation.quality.utmos.repo` and `validation.quality.utmos.checkpoint`; see [the pinned metric instructions](metrics.md). The runner does not download these assets or silently substitute reconstruction loss when the requested metric is unavailable.
+
+Inspect without training:
+
+```bash
+python -m realtime_use.train experiment=paper_flexible12 --cfg job --resolve
+```
+
+Example of a later regression run after preparing data and metric assets:
+
+```bash
+python -m realtime_use.train \
+  experiment=paper_flexible12 \
+  data.train_manifest=/absolute/path/to/native-rate-train.jsonl \
+  data.validation_manifest=/absolute/path/to/native-rate-validation.jsonl \
+  validation.quality.utmos.repo=/absolute/path/to/SpeechMOS-v1.2.0 \
+  validation.quality.utmos.checkpoint=/absolute/path/to/utmos22_strong_step7459_v1.pt \
+  training.stage=regression \
+  trainer.accelerator=gpu trainer.devices=1 \
+  output_dir=runs/paper-flexible12-regression
+```
+
+Optional `validation.early_stopping.patience` counts validation checks without sufficient monitor improvement; `validation.early_stopping.min_delta` sets the minimum improvement. Patience is unset by default so the software does not invent a convergence rule. Choose and record it for the pilot; it does not automatically choose or perform the decoder or adversarial transition.
+
+`training.split_decoders_at=null` intentionally leaves the shared decoder active until a transition is chosen. After inspecting convergence, a changed split schedule requires a new run initialized with `init_from`; it starts a fresh optimizer and update count. Set the split step relative to that new run. Native `resume` preserves the original split schedule. Changing to `training.stage=adversarial` is a separate new-stage initialization via `init_from`. Neither transition schedule is presented as the authors' recovered schedule. Review native-rate batching, short-clip handling and validation target alignment in [data/README.md](../data/README.md).
+
+## Preflight without training
+
+After preparing the environment, manifests and metric assets, run the same profile through the separate preflight entry point:
+
+```bash
+python -m realtime_use.preflight \
+  experiment=paper_flexible12 \
+  data.train_manifest=/absolute/path/to/native-rate-train.jsonl \
+  data.validation_manifest=/absolute/path/to/native-rate-validation.jsonl \
+  validation.quality.utmos.repo=/absolute/path/to/SpeechMOS-v1.2.0 \
+  validation.quality.utmos.checkpoint=/absolute/path/to/utmos22_strong_step7459_v1.pt \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+The installed `realtime-use-preflight` command accepts the same Hydra overrides. It performs dataset setup and loads the requested local metric assets, then instantiates the actual configured model and checks short deterministic FP32 full/streaming outputs for all rates, exits and lookahead branches. Its report includes parameter counts and peak CUDA allocation. It does not construct a Trainer, update parameters or write model checkpoints.
+
+This is a one-device inference preflight, even when the eventual training job uses several devices. It does not validate gradients, AMP, NCCL, optimizer state, speech quality, full-size training memory or update throughput. Use the non-training CUDA gradient tests above for gradient coverage, then separately authorize and measure a pilot when ready.
 
 ## Runs and sweeps
 
@@ -124,9 +176,9 @@ Choose another unused master port when running concurrent local jobs. The explic
 
 The generator-update batch size is `world_size × training.batch_size × training.grad_accum` for full microbatches. `training.batch_size` is per rank. Partial batches can reduce the actual number of examples, and the training distributed sampler may repeat a few rows to give ranks equal work. Increasing GPU count does not automatically justify a proportional learning-rate change.
 
-All ranks use the same sampled exit for each training microbatch. Decoder heads are registered before DDP setup, and the shared-to-per-exit transition copies weights without replacing registered parameters. The strategy enables unused-parameter handling and disables static-graph assumptions because active exits and GAN optimizer phases change which parameters receive gradients.
+All ranks use the same sampled exit and lookahead for each training microbatch. Native-rate batching coordinates the rate across ranks so the same rate-dependent objective and critic modules are active. Decoder heads are registered before DDP setup, and the shared-to-per-exit transition copies weights without replacing registered parameters. The strategy enables unused-parameter handling and disables static-graph assumptions because active exits and GAN optimizer phases change which parameters receive gradients.
 
-Validation pads rank workloads where necessary but marks padding rows invalid. Global loss is computed from summed valid-example losses and counts, so a complete pass counts every original validation example once, including when the dataset size is not divisible by world size. `training.validation_batches` limits batches **per rank**; a capped pass may cover only a subset. Use a sufficient limit for a full validation-set result.
+Validation pads rank workloads where necessary but marks padding rows invalid. Global loss is computed from summed valid-example losses and counts, so a complete pass counts every original validation example once, including when the dataset size is not divisible by world size. `training.validation_batches` limits batches **per rank**; a capped pass may cover only a subset. Set it to `null` for all batches. Set `data.validation_full_utterance=true` to evaluate complete recordings; otherwise the configured crop still applies.
 
 Checkpoint participation is collective, while checkpoint files and run logs are written by rank zero. Native resume preserves each rank's main-process Python, NumPy, and PyTorch random states and requires the same world size. Worker prefetch/crop order is not replayed exactly; changing world size is a fresh initialization experiment. Keep architecture, optimizer structure, accumulation, and stage compatible with the checkpoint.
 
@@ -150,7 +202,7 @@ The run writes native Lightning checkpoints under `checkpoints/`:
 
 - `last.ckpt`: the latest saved training state, refreshed at normal training completion.
 - `step_*.ckpt`: periodic snapshots named by completed generator updates.
-- `best.ckpt`: selected by `validation_mean_clean_loss` when validation is configured.
+- `best.ckpt`: minimizes `validation_mean_clean_loss` for the baseline monitor, or maximizes `validation_mean_utmos` for the paper profile. Required metric assets must be available; a requested UTMOS monitor is not replaced by a surrogate.
 
 The native checkpoint also includes `model_config`, `model_state`, `stage`, and `step` compatibility fields. Existing `infer`, `evaluate`, `benchmark`, and `export` commands can read the enhancement weights without constructing the training loop.
 
@@ -205,7 +257,13 @@ The former argparse training flags are not preserved. Update scripts as follows:
 
 Earlier portable `.pt` checkpoints can initialize compatible enhancement weights through `init_from`; they do not contain native Lightning loop state and cannot provide a full Lightning resume. Retain them for inference/export or fresh-stage initialization. New training checkpoints use `.ckpt`; exported inference-only checkpoints may still use `.pt`.
 
-Inference, evaluation, export, and benchmark commands retain their existing flag-based interfaces. Changing the training runner does not require changing those commands beyond selecting the new checkpoint path.
+Inference, evaluation, export, and benchmark remain flag-based commands. Inference and benchmark accept `--sample-rate` and `--lookahead`; export can prune both the selected exit and input branch, optionally retaining only one rate with `--single-rate`. See [README.md](../README.md) and [metric evaluation](metrics.md) for current flags. Programmatic `enhance(..., sample_rate=None, lookahead=0)` and `StreamingEnhancer(..., sample_rate=None, lookahead=0)` preserve their earlier defaults; explicitly pass the retained branch when an export contains only lookahead 1 or 2.
+
+## Test execution modes
+
+Use `python -m pytest -q --no-training` for the current non-training verification. Individual `training_loop` markers exclude optimizer-step, Lightning fit, and subprocess training-worker cases while retaining non-training configuration, validation and gradient coverage. Session guards fail an unmarked call to `Trainer.fit` or a PyTorch optimizer step before the operation executes. Recognized training CLI/worker subprocess launches are also blocked; read-only Hydra config rendering is retained. These guards are test-local and do not change the production training APIs.
+
+Push and pull-request CI uses this mode. Its small metric dependencies include `pystoi` and `soxr` for actual ESTOI adapter parity; it does not fetch heavyweight metric assets. An explicitly requested manual `workflow_dispatch` can set `run_training_tests=true` to run the full suite. Local `python -m pytest -q` also includes optimizer/lifecycle tests and should only be used when that execution is intended. Earlier CPU/Gloo lifecycle results are historical evidence, not tests rerun during the current no-training update.
 
 ## Smoke and validation scope
 

@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from .augmentation import augmentation_enabled
 from .config import ModelConfig
 from .data import PairedAudioDataset, SyntheticDataset, collate_audio
-from .distributed_data import PaddedValidationSampler, ValidationDataset
+from .distributed_data import PaddedValidationSampler, RateBucketBatchSampler, ValidationDataset
 
 
 class PairedAudioDataModule(LightningDataModule):
@@ -39,6 +39,7 @@ class PairedAudioDataModule(LightningDataModule):
         data = self.config.get("data", {})
         loss = self.config.get("loss", {})
         self.sample_rate = model.sample_rate
+        self.sample_rates = tuple(getattr(model, "sample_rates", ())) or (self.sample_rate,)
         self.seed = int(self.config.get("seed", 0))
         self.batch_size = training.get("batch_size", 4)
         self.workers = training.get("workers", 0)
@@ -48,6 +49,7 @@ class PairedAudioDataModule(LightningDataModule):
         crop_seconds = float(training.get("crop_seconds", 2.0))
         if not math.isfinite(crop_seconds) or crop_seconds <= 0:
             raise ValueError("training.crop_seconds must be finite and positive")
+        self.crop_seconds = crop_seconds
         self.crop_samples = round(crop_seconds * self.sample_rate)
         if self.crop_samples < 1:
             raise ValueError("training.crop_seconds must produce at least one sample")
@@ -60,6 +62,9 @@ class PairedAudioDataModule(LightningDataModule):
         self.load_teacher = stage == "regression" and kd_weight > 0
         self.smoke = data.get("smoke", False)
         self.pin_memory = data.get("pin_memory", False)
+        self.validation_full_utterance = data.get("validation_full_utterance", False)
+        if not isinstance(self.validation_full_utterance, bool):
+            raise ValueError("data.validation_full_utterance must be a boolean")
         self.augmentation = data.get("augmentation")
         augmentation_enabled(self.augmentation)
         if not isinstance(self.smoke, bool) or not isinstance(self.pin_memory, bool):
@@ -88,8 +93,8 @@ class PairedAudioDataModule(LightningDataModule):
                     raise ValueError("data.train_manifest is required unless data.smoke=true")
                 dataset = PairedAudioDataset(
                     self.train_manifest,
-                    self.sample_rate,
-                    crop_samples=self.crop_samples,
+                    self.sample_rates,
+                    crop_seconds=self.crop_seconds,
                     training=True,
                     load_teacher=self.load_teacher,
                     augmentation=self.augmentation,
@@ -104,8 +109,8 @@ class PairedAudioDataModule(LightningDataModule):
                 SyntheticDataset(self.sample_rate, self.crop_samples, length=2)
                 if self.smoke else PairedAudioDataset(
                     self.validation_manifest,
-                    self.sample_rate,
-                    crop_samples=self.crop_samples,
+                    self.sample_rates,
+                    crop_seconds=None if self.validation_full_utterance else self.crop_seconds,
                     training=False,
                     load_teacher=False,
                 )
@@ -120,8 +125,16 @@ class PairedAudioDataModule(LightningDataModule):
     def _loader(self, dataset: Dataset, *, shuffle: bool) -> DataLoader:
         world_size, rank = self._distributed_context()
         sampler = None
+        rates = getattr(dataset, "item_sample_rates", None)
+        native_multi_rate = rates is not None and len(set(rates)) > 1
         if not shuffle:
             dataset = ValidationDataset(dataset)
+        if native_multi_rate:
+            batch_sampler = RateBucketBatchSampler(rates, self.batch_size, num_replicas=world_size,
+                                                    rank=rank, shuffle=shuffle, seed=self.seed)
+            return DataLoader(dataset, batch_sampler=batch_sampler, num_workers=self.workers,
+                              collate_fn=collate_audio, pin_memory=self.pin_memory,
+                              persistent_workers=self.workers > 0)
         if world_size > 1:
             sampler = (
                 DistributedSampler(dataset, num_replicas=world_size, rank=rank,

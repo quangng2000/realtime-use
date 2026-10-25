@@ -2,7 +2,8 @@
 
 The author codec is an explicit adaptation, not a released streaming checkpoint.
 Frequency context is bidirectional within an available frame. Temporal context
-is strictly causal. Parameter counts must be measured for this implementation.
+is causal after the explicitly selected input lookahead. Parameter counts must
+be measured for this implementation.
 """
 
 import copy
@@ -117,7 +118,7 @@ class Enhancer(nn.Module):
         self.config = copy.deepcopy(config)
         if config.codec_impl == "nemotron_causal":
             from .author_codec import AuthorEncoder
-            self.encoder = AuthorEncoder(config.width)
+            self.encoder = AuthorEncoder(config.width, config.lookahead_frames)
             self.encoder_norm = nn.Identity()
         else:
             self.encoder = CausalFeatureConv(3, config.width)
@@ -130,7 +131,23 @@ class Enhancer(nn.Module):
         else:
             self.decoders.update({str(depth): self._new_decoder() for depth in config.exits})
         from .audio import SpectralTransform
-        self.transform = SpectralTransform(config.sample_rate, config.window_ms, config.hop_ms)
+        self.transform = SpectralTransform(config.sample_rate, config.window_ms, config.hop_ms, config.window_type)
+
+    def transform_for(self, sample_rate: int | None = None):
+        """Select a native-rate transform without adding checkpoint buffers."""
+        sample_rate = self.config.sample_rate if sample_rate is None else sample_rate
+        if (isinstance(sample_rate, bool) or not isinstance(sample_rate, int)
+                or sample_rate not in self.config.supported_sample_rates):
+            raise ValueError(f"sample_rate must be one of {self.config.supported_sample_rates}")
+        if sample_rate == self.config.sample_rate:
+            return self.transform
+        from .audio import SpectralTransform
+        return SpectralTransform(sample_rate, self.config.window_ms, self.config.hop_ms,
+                                 self.config.window_type).to(self.transform.window.device)
+
+    def _check_lookahead(self, lookahead: int) -> None:
+        if isinstance(lookahead, bool) or not isinstance(lookahead, int) or lookahead not in self.config.lookahead_frames:
+            raise ValueError(f"lookahead must be one of {self.config.lookahead_frames}")
 
     def _new_decoder(self) -> nn.Module:
         if self.config.codec_impl == "nemotron_causal":
@@ -157,11 +174,12 @@ class Enhancer(nn.Module):
             return self.shared_decoder
         return self.decoders[str(exit_depth)]
 
-    def forward(self, spectrum: Tensor, exit_depths=None) -> dict[int, Tensor]:
+    def forward(self, spectrum: Tensor, exit_depths=None, lookahead: int = 0) -> dict[int, Tensor]:
         if spectrum.ndim != 3 or not spectrum.is_complex() or spectrum.shape[1] == 0:
             raise ValueError("Expected nonempty complex [batch, time, frequency]")
         exits = self._exit_list(exit_depths)
-        x = (self.encoder(spectrum) if self.config.codec_impl == "nemotron_causal"
+        self._check_lookahead(lookahead)
+        x = (self.encoder(spectrum, lookahead=lookahead) if self.config.codec_impl == "nemotron_causal"
              else F.silu(self.encoder_norm(self.encoder(self._features(spectrum)))))
         result = {}
         for depth, block in enumerate(self.blocks, 1):
@@ -172,12 +190,15 @@ class Enhancer(nn.Module):
                 break
         return result
 
-    def enhance(self, waveform: Tensor, exit_depths=None) -> dict[int, Tensor]:
+    def enhance(self, waveform: Tensor, exit_depths=None, sample_rate: int | None = None,
+                lookahead: int = 0) -> dict[int, Tensor]:
         if waveform.ndim != 2 or waveform.shape[-1] < 1:
             raise ValueError("Expected nonempty [batch, samples]")
         # FFT remains FP32 under mixed-precision training; learned layers use autocast.
-        spectrum = self.transform.analysis(waveform.float())
-        return {depth: self.transform.synthesis(value, waveform.shape[-1]) for depth, value in self(spectrum, exit_depths).items()}
+        transform = self.transform_for(sample_rate)
+        spectrum = transform.analysis(waveform.float())
+        return {depth: transform.synthesis(value, waveform.shape[-1])
+                for depth, value in self(spectrum, exit_depths, lookahead=lookahead).items()}
 
     def split_decoders(self) -> None:
         if self.config.decoder_mode == "per_exit":
@@ -205,17 +226,23 @@ class Enhancer(nn.Module):
             decoder.load_state_dict(state, strict=True)
         self.config.decoder_mode = "per_exit"
 
-    def step(self, frame: Tensor, state: dict | None = None, exit_depth: int | None = None) -> tuple[Tensor, dict]:
+    def step(self, frame: Tensor, state: dict | None = None, exit_depth: int | None = None,
+             lookahead: int = 0) -> tuple[Tensor | None, dict]:
         if frame.ndim != 2 or not frame.is_complex():
             raise ValueError("Expected complex [batch, frequency]")
         exit_depth = max(self.config.exits) if exit_depth is None else exit_depth
         self._exit_list((exit_depth,))
+        self._check_lookahead(lookahead)
         if state is None:
-            state = {"encoder": None, "blocks": [None] * exit_depth, "decoder": None, "exit_depth": exit_depth, "shape": tuple(frame.shape)}
-        if state["exit_depth"] != exit_depth or state["shape"] != tuple(frame.shape):
-            raise ValueError("Exit or stream shape changed; reset state before switching")
+            state = {"encoder": None, "blocks": [None] * exit_depth, "decoder": None, "exit_depth": exit_depth,
+                     "shape": tuple(frame.shape), "lookahead": lookahead}
+        if (state["exit_depth"] != exit_depth or state["shape"] != tuple(frame.shape)
+                or state.get("lookahead", 0) != lookahead):
+            raise ValueError("Exit, lookahead or stream shape changed; reset state before switching")
         if self.config.codec_impl == "nemotron_causal":
-            x, encoder = self.encoder.step(frame, state["encoder"])
+            x, encoder = self.encoder.step(frame, state["encoder"], lookahead=lookahead)
+            if x is None:
+                return None, {**state, "encoder": encoder}
         else:
             x, encoder = self.encoder.step(self._features(frame), state["encoder"])
             x = F.silu(self.encoder_norm(x))
@@ -224,9 +251,13 @@ class Enhancer(nn.Module):
             x, block_state = self.blocks[i].step(x, state["blocks"][i])
             block_states.append(block_state)
         output, decoder = self._decoder(exit_depth).step(x, frame, state["decoder"])
-        return output, {"encoder": encoder, "blocks": block_states, "decoder": decoder, "exit_depth": exit_depth, "shape": tuple(frame.shape)}
+        return output, {"encoder": encoder, "blocks": block_states, "decoder": decoder,
+                        "exit_depth": exit_depth, "shape": tuple(frame.shape), "lookahead": lookahead}
 
-    def active_parameter_count(self, exit_depth: int) -> int:
+    def active_parameter_count(self, exit_depth: int, lookahead: int = 0) -> int:
         self._exit_list((exit_depth,))
-        modules = [self.encoder, self.encoder_norm, *self.blocks[:exit_depth], self._decoder(exit_depth)]
-        return sum(p.numel() for module in modules for p in module.parameters())
+        self._check_lookahead(lookahead)
+        modules = [self.encoder_norm, *self.blocks[:exit_depth], self._decoder(exit_depth)]
+        encoder = (self.encoder.active_parameter_count(lookahead) if self.config.codec_impl == "nemotron_causal"
+                   else sum(parameter.numel() for parameter in self.encoder.parameters()))
+        return encoder + sum(p.numel() for module in modules for p in module.parameters())

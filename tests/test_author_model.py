@@ -139,6 +139,7 @@ def test_author_exit_export_preserves_selected_head_and_streaming(tmp_path, deco
 
 
 @pytest.mark.parametrize("stage", ["regression", "adversarial"])
+@pytest.mark.training_loop
 def test_author_training_native_resume_split_and_architecture_guards(tmp_path, stage):
     config = hydra_config(tmp_path / "regression")
     path = run_training(config)
@@ -213,6 +214,7 @@ def _ddp_worker(output_dir):
 
 @pytest.mark.skipif(not torch.distributed.is_available() or not torch.distributed.is_gloo_available(),
                     reason="Requires two-process CPU/Gloo support")
+@pytest.mark.training_loop
 def test_author_codec_two_rank_training_split_and_optimizer_agreement(tmp_path):
     from test_ddp import assert_nested_close, run_process, torchrun_prefix
 

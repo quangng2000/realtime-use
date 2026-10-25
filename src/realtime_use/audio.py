@@ -1,7 +1,8 @@
 """Differentiable, uncentered transforms and bounded-state streaming inference.
 
 Past zero padding initializes overlap-add. The first valid output requires a
-full analysis window of input. Right zero padding occurs only at end-of-stream.
+full analysis window plus the selected lookahead hops. Right zero padding occurs
+only at end-of-stream.
 Retained samples have complete overlap, avoiding singular window endpoints.
 """
 
@@ -17,13 +18,16 @@ if TYPE_CHECKING:
 
 
 class SpectralTransform(nn.Module):
-    def __init__(self, sample_rate: int, window_ms: float, hop_ms: float):
+    def __init__(self, sample_rate: int, window_ms: float, hop_ms: float, window_type: str = "sqrt_hann"):
         super().__init__()
         self.window_samples = round(sample_rate * window_ms / 1000)
         self.hop_samples = round(sample_rate * hop_ms / 1000)
         if self.hop_samples < 1 or self.window_samples != 2 * self.hop_samples:
             raise ValueError("Transform requires window = 2 * hop, with positive integer samples")
-        self.register_buffer("window", torch.hann_window(self.window_samples).sqrt())
+        if window_type not in {"hann", "sqrt_hann"}:
+            raise ValueError("window_type must be hann or sqrt_hann")
+        window = torch.hann_window(self.window_samples)
+        self.register_buffer("window", window.sqrt() if window_type == "sqrt_hann" else window)
 
     def frame_count(self, length: int) -> int:
         if length < 1:
@@ -63,14 +67,17 @@ class StreamingEnhancer:
     once to recover exactly the original sample count. Reset between clips.
     """
 
-    def __init__(self, model: "Enhancer", exit_depth: int):
+    def __init__(self, model: "Enhancer", exit_depth: int, sample_rate: int | None = None, lookahead: int = 0):
         if model.training:
             raise ValueError("StreamingEnhancer requires model.eval()")
         if exit_depth not in model.config.exits:
             raise ValueError("Exit is not configured in this model")
         self.model = model
         self.exit_depth = exit_depth
-        self.transform = model.transform
+        model._check_lookahead(lookahead)
+        self.lookahead = lookahead
+        self.sample_rate = model.config.sample_rate if sample_rate is None else sample_rate
+        self.transform = model.transform_for(sample_rate)
         self.reset()
 
     def reset(self) -> None:
@@ -81,23 +88,33 @@ class StreamingEnhancer:
         self._received = 0
         self._emitted = 0
         self._frames = 0
+        self._output_frames = 0
         self._finished = False
 
     def _frame(self) -> Tensor:
         width, hop = self.transform.window_samples, self.transform.hop_samples
         window = self.transform.window.float()
         spectrum = torch.fft.rfft(self._input[:, :width] * window, dim=-1)
-        enhanced, self._state = self.model.step(spectrum, self._state, exit_depth=self.exit_depth)
+        self._input = self._input[:, hop:]
+        self._frames += 1
+        return self._spectral_frame(spectrum)
+
+    def _spectral_frame(self, spectrum: Tensor) -> Tensor:
+        width, hop = self.transform.window_samples, self.transform.hop_samples
+        window = self.transform.window.float()
+        enhanced, self._state = self.model.step(spectrum, self._state, exit_depth=self.exit_depth,
+                                               lookahead=self.lookahead)
+        if enhanced is None:
+            return spectrum.real[:, :0]
         frame = torch.fft.irfft(enhanced, n=width, dim=-1) * window
         self._overlap = self._overlap + frame
         self._weights = self._weights + window.square()
         output = self._overlap[:, :hop] / self._weights[:hop].clamp_min(1e-8)
         self._overlap = F.pad(self._overlap[:, hop:], (0, hop))
         self._weights = F.pad(self._weights[hop:], (0, hop))
-        self._input = self._input[:, hop:]
-        self._frames += 1
+        self._output_frames += 1
         # The first emitted hop is artificial past padding, not user audio.
-        return output[:, :0] if self._frames == 1 else output
+        return output[:, :0] if self._output_frames == 1 else output
 
     @torch.no_grad()
     def push(self, chunk: Tensor) -> Tensor:
@@ -143,6 +160,13 @@ class StreamingEnhancer:
         while self._frames < count:
             self._input = F.pad(self._input, (0, self.transform.window_samples - self._input.shape[-1]))
             pieces.append(self._frame())
+        # Right-padding the first feature convolution is zero in magnitude and
+        # phase, represented by zero complex frames. Feed only the pending
+        # lookahead count; no extra audio analysis frames or outputs are added.
+        silence = torch.zeros(self._input.shape[0], self.transform.window_samples // 2 + 1,
+                              device=self._input.device, dtype=torch.complex64)
+        for _ in range(self.lookahead):
+            pieces.append(self._spectral_frame(silence))
         pieces.append(self._overlap / self._weights.clamp_min(1e-8))
         output = torch.cat(pieces, dim=-1)[:, :needed]
         self._emitted += output.shape[-1]

@@ -117,6 +117,7 @@ def assert_equivalent_update(actual, reference):
 
 
 @pytest.mark.parametrize("stage", ["regression", "adversarial"])
+@pytest.mark.training_loop
 def test_ddp_gradients_match_single_process_equivalent_global_batch(tmp_path, stage):
     distributed, single = tmp_path / "distributed", tmp_path / "single"
     common = [str(WORKER), "--mode", "equivalence", "--stage", stage]
@@ -169,6 +170,7 @@ def full_validation_loss(portable, manifest):
         torch.set_num_threads(previous_threads)
 
 
+@pytest.mark.training_loop
 def test_ddp_sampled_exits_decoder_transition_resume_and_exact_validation(tmp_path):
     train, validation = write_manifests(tmp_path / "data")
     output = tmp_path / "lifecycle"
@@ -197,6 +199,7 @@ def test_ddp_sampled_exits_decoder_transition_resume_and_exact_validation(tmp_pa
         rel=3e-5, abs=3e-6)
 
 
+@pytest.mark.training_loop
 def test_hydra_internal_ddp_and_external_torchrun_gan_entrypoints(tmp_path):
     train, validation = write_manifests(tmp_path / "data")
     common = ["experiment=fixed4", "model.sample_rate=800", "model.depth=1", "model.exits=[1]",

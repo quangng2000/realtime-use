@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_training_tests:
+        description: "Explicitly run optimizer and training lifecycle tests"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,5 +38,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -e '.[test,augmentation,gan]'
-      - name: Run library, legacy-reference, Lightning, and CPU Gloo integration tests
+          python -m pip install pystoi==0.4.1 soxr==0.5.0.post1
+      - name: Run inference, gradient, validation, data, and metric tests without training
+        if: github.event_name != 'workflow_dispatch' || !inputs.run_training_tests
+        run: python -m pytest -q --no-training
+      - name: Run full suite including explicitly requested training tests
+        if: github.event_name == 'workflow_dispatch' && inputs.run_training_tests
         run: python -m pytest -q

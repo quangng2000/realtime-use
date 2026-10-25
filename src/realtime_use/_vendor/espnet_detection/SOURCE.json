@@ -1,0 +1,14 @@
+{
+  "project": "ESPnet",
+  "version": "202509",
+  "commit": "eaf9a83f5f5a7427651b2eb4b6438a9a6427ebf0",
+  "source": "https://github.com/espnet/espnet/blob/eaf9a83f5f5a7427651b2eb4b6438a9a6427ebf0/espnet2/train/preprocessor.py",
+  "license": "Apache-2.0",
+  "source_file_sha256": "6217a163e2e6e02aabfc7b1a6b671c325e9c8109738f64535a5d998b9ec833fc",
+  "functions": [
+    "framing",
+    "detect_non_silence"
+  ],
+  "function_block_sha256": "75f5ba9f4534f03e64d31769f8df7f0a7536360e4df8cdabb45b45e132c1e52c",
+  "modifications": "Only module imports/header isolated. Function block is byte-identical to ESPnet202509 wheel."
+}

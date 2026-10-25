@@ -5,6 +5,7 @@ defaults:
 - loss: reconstruction
 - adversarial: default
 - trainer: default
+- validation: signal
 - experiment: null
 - _self_
 seed: 0

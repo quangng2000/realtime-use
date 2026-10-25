@@ -1,4 +1,5 @@
 implementation: auraloss
+sample_rate_scaling: false
 waveform: 1.0
 stft: 1.0
 kd: 0.0

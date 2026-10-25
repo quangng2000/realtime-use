@@ -70,6 +70,7 @@ def tiny_paired_config(tmp_path):
     return cfg,manifest
 
 
+@pytest.mark.training_loop
 def test_native_kd_split_gan_resume_and_inference_export(tmp_path):
     cfg,manifest=tiny_paired_config(tmp_path)
     first=run_training(cfg)
@@ -129,6 +130,7 @@ def test_official_run_rejects_legacy_weights_before_creating_output(tmp_path):
     assert not Path(cfg.output_dir).exists()
 
 
+@pytest.mark.training_loop
 def test_legacy_weights_initialize_but_cannot_native_resume(tmp_path):
     cfg,_=tiny_paired_config(tmp_path)
     cfg.training.steps=1
@@ -160,13 +162,18 @@ def test_entrypoint_accepts_ddp_and_rejects_unsafe_strategy_and_missing_data(tmp
         run_training(cfg)
 
 
-def test_hydra_cli_render_and_two_job_smoke_sweep(tmp_path):
+def test_hydra_cli_render_without_training(tmp_path):
     env=dict(os.environ,OMP_NUM_THREADS="1",MKL_NUM_THREADS="1")
     render=subprocess.run([sys.executable,"-m","realtime_use.train","experiment=flexible12",
         "--cfg","job","--resolve"],capture_output=True,text=True,env=env,timeout=60)
     assert render.returncode == 0, render.stdout+render.stderr
     rendered=OmegaConf.create(render.stdout)
     assert list(rendered.model.exits)==[4,8,12]
+
+
+@pytest.mark.training_loop
+def test_hydra_two_job_smoke_sweep(tmp_path):
+    env=dict(os.environ,OMP_NUM_THREADS="1",MKL_NUM_THREADS="1")
     sweep=subprocess.run([sys.executable,"-m","realtime_use.train","-m",
         "experiment=fixed4,fixed8","smoke=true","training.steps=1",
         "trainer.enable_progress_bar=false",f"hydra.sweep.dir={tmp_path}/sweep"],

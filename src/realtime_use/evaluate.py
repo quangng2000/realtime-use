@@ -1,4 +1,4 @@
-"""Paired signal metrics with a noisy bypass baseline; not paper-quality claims."""
+"""Paired signal and optional published quality metrics with a noisy baseline."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from torchmetrics.functional.audio import scale_invariant_signal_distortion_rati
 
 from .data import PairedAudioDataset, SyntheticDataset
 from .infer import enhance_waveform, load_model
+from .quality_metrics import QualityEvaluator
 
 
 METRIC_IMPLEMENTATIONS = {
@@ -71,6 +72,31 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def summarize_quality(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Keep optional score names explicit; no missing-score imputation."""
+    names = sorted({name for row in rows for name in row.get("quality", {})})
+    result = {}
+    for name in names:
+        values = [row["quality"][name] for row in rows if name in row.get("quality", {})]
+        result[name] = {"mean": sum(values) / len(values), "valid_utterances": len(values)}
+    if "cacc" in names:
+        weighted = [(row["quality"]["cacc"], row.get("cacc_reference_characters", 0))
+                    for row in rows if "cacc" in row.get("quality", {})]
+        characters = sum(count for _, count in weighted)
+        if characters:
+            result["cacc"]["corpus_character_accuracy"] = sum(score * count for score, count in weighted) / characters
+            result["cacc"]["reference_characters"] = characters
+    return result
+
+
+def _summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    result = summarize_metrics(rows)
+    quality = summarize_quality(rows)
+    if quality:
+        result["quality"] = quality
+    return result
+
+
 @torch.inference_mode()
 def evaluate_dataset(
     model: Any,
@@ -79,49 +105,96 @@ def evaluate_dataset(
     streaming: bool = False,
     chunk_samples: int | None = None,
     check_clean: bool = False,
+    quality_evaluator: QualityEvaluator | None = None,
+    lookaheads: tuple[int, ...] | list[int] = (0,),
+    text_metadata: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     exits = tuple(model.config.exits) if exits is None else tuple(exits)
-    if not exits or any(depth not in model.config.exits for depth in exits):
+    if not exits or len(set(exits)) != len(exits) or any(depth not in model.config.exits for depth in exits):
         raise ValueError(f"evaluation exits must be drawn from {model.config.exits}")
+    lookaheads = tuple(lookaheads)
+    allowed_ahead = getattr(model.config, "lookahead_frames", (0,))
+    if (not lookaheads or len(set(lookaheads)) != len(lookaheads)
+            or any(isinstance(value, bool) or not isinstance(value, int) or value not in allowed_ahead for value in lookaheads)):
+        raise ValueError(f"evaluation lookaheads must be drawn from {allowed_ahead}")
+    allowed_rates = getattr(model.config, "supported_sample_rates", (model.config.sample_rate,))
     records = []
     for index in range(len(dataset)):
         item = dataset[index]
         length = int(item.get("length", item["clean"].numel()))
+        if not 0 < length <= item["clean"].numel() or length > item["noisy"].numel():
+            raise ValueError("invalid evaluation utterance length")
+        rate = int(item.get("sample_rate", model.config.sample_rate))
+        if rate not in allowed_rates:
+            raise ValueError(f"utterance sample rate {rate} is not configured: {allowed_rates}")
         noisy, clean = item["noisy"][:length], item["clean"][:length]
-        bypass = signal_metrics(noisy, clean)
-        record: dict[str, Any] = {"id": str(item.get("id", index)), "samples": length, "bypass": bypass, "exits": {}}
-        if check_clean:
-            record["clean_input_preservation"] = {}
-        for depth in exits:
-            enhanced = enhance_waveform(model, noisy, depth, streaming, chunk_samples)[0]
-            measured = signal_metrics(enhanced, clean)
-            measured["si_sdr_improvement_db"] = (
-                measured["si_sdr_db"] - bypass["si_sdr_db"]
-                if measured["si_sdr_db"] is not None and bypass["si_sdr_db"] is not None else None
-            )
-            record["exits"][str(depth)] = measured
+        identifier = str(item.get("id", index))
+        text = (text_metadata or {}).get(identifier, item)
+
+        def measure(estimate):
+            measured = signal_metrics(estimate, clean)
+            if quality_evaluator is not None and quality_evaluator.metrics:
+                measured["quality"] = quality_evaluator.score(
+                    estimate, clean, rate, transcript=text.get("transcript"), language=text.get("language"))
+                cacc = quality_evaluator.backends.get("cacc")
+                if cacc is not None:
+                    measured["cacc_reference_characters"] = cacc.last_reference_characters
+            return measured
+
+        def enhance(waveform, depth, ahead):
+            # Preserve the simple legacy callable contract at its default rate.
+            if rate == model.config.sample_rate and ahead == 0:
+                return enhance_waveform(model, waveform, depth, streaming, chunk_samples)[0]
+            return enhance_waveform(model, waveform, depth, streaming, chunk_samples,
+                                    sample_rate=rate, lookahead=ahead)[0]
+
+        bypass = measure(noisy)
+        record: dict[str, Any] = {"id": identifier, "samples": length, "sample_rate": rate,
+                                  "bypass": bypass, "by_lookahead": {}}
+        for ahead in lookaheads:
+            scenario: dict[str, Any] = {"exits": {}}
             if check_clean:
-                clean_enhanced = enhance_waveform(model, clean, depth, streaming, chunk_samples)[0]
-                record["clean_input_preservation"][str(depth)] = signal_metrics(clean_enhanced, clean)
+                scenario["clean_input_preservation"] = {}
+            for depth in exits:
+                measured = measure(enhance(noisy, depth, ahead))
+                measured["si_sdr_improvement_db"] = (
+                    measured["si_sdr_db"] - bypass["si_sdr_db"]
+                    if measured["si_sdr_db"] is not None and bypass["si_sdr_db"] is not None else None
+                )
+                scenario["exits"][str(depth)] = measured
+                if check_clean:
+                    scenario["clean_input_preservation"][str(depth)] = measure(enhance(clean, depth, ahead))
+            record["by_lookahead"][str(ahead)] = scenario
+        # Preserve old consumers: top-level exits refer to primary_lookahead.
+        record.update(record["by_lookahead"][str(lookaheads[0])])
         records.append(record)
     if not records:
         raise ValueError("evaluation requires at least one example")
-    summary: dict[str, Any] = {
-        "bypass": summarize_metrics([record["bypass"] for record in records]),
-        "exits": {str(depth): summarize_metrics([record["exits"][str(depth)] for record in records]) for depth in exits},
-    }
-    if check_clean:
-        summary["clean_input_preservation"] = {
-            str(depth): summarize_metrics([record["clean_input_preservation"][str(depth)] for record in records])
-            for depth in exits
-        }
+
+    def summarize_examples(examples):
+        summary = {"bypass": _summary([row["bypass"] for row in examples]), "by_lookahead": {}}
+        for ahead in lookaheads:
+            scenario = {"exits": {str(depth): _summary([
+                row["by_lookahead"][str(ahead)]["exits"][str(depth)] for row in examples]) for depth in exits}}
+            if check_clean:
+                scenario["clean_input_preservation"] = {str(depth): _summary([
+                    row["by_lookahead"][str(ahead)]["clean_input_preservation"][str(depth)]
+                    for row in examples]) for depth in exits}
+            summary["by_lookahead"][str(ahead)] = scenario
+        summary.update(summary["by_lookahead"][str(lookaheads[0])])
+        return summary
+
+    rates = sorted({row["sample_rate"] for row in records})
     return {
-        "sample_rate": model.config.sample_rate,
-        "inference_mode": "streaming" if streaming else "whole_waveform_causal_model",
-        "exits": list(exits),
+        "sample_rate": rates[0] if len(rates) == 1 else None,
+        "sample_rates": rates,
+        "inference_mode": "streaming" if streaming else "whole_waveform",
+        "exits": list(exits), "lookahead_frames": list(lookaheads), "primary_lookahead": lookaheads[0],
         "metric_implementations": METRIC_IMPLEMENTATIONS,
-        "limitations": "Signal metrics only. No PESQ, STOI, perceptual MOS, ASR/content, speaker identity, or listening test is measured. These results do not establish paper parity or production readiness.",
-        "summary": summary,
+        "quality_metric_implementations": quality_evaluator.metadata if quality_evaluator is not None else {},
+        "limitations": "Only explicitly requested scores are measured. No listening test, paper parity, or production readiness is established. Learned metric backends require separately provisioned local assets; unrequested metrics are absent. Aggregate means weight utterances equally; per-rate results are also reported.",
+        "summary": summarize_examples(records),
+        "summary_by_sample_rate": {str(rate): summarize_examples([row for row in records if row["sample_rate"] == rate]) for rate in rates},
         "examples": records,
     }
 
@@ -138,14 +211,23 @@ def main() -> None:
     parser.add_argument("--stream", action="store_true")
     parser.add_argument("--chunk-samples", type=int)
     parser.add_argument("--check-clean", action="store_true")
+    parser.add_argument("--lookaheads", default="0", help="Comma-separated configured lookahead frame counts")
+    parser.add_argument("--metrics", default="", help="Optional comma-separated metrics: pesq,utmos,estoi,dnsmos,nisqa,speechbert_score,lps,cacc")
+    parser.add_argument("--metrics-config", help="JSON mapping metric names to explicit local asset settings")
     args = parser.parse_args()
     model = load_model(args.checkpoint, args.device)
     dataset = (
         SyntheticDataset(model.config.sample_rate, model.config.sample_rate // 5, length=2)
-        if args.smoke else PairedAudioDataset(args.manifest, model.config.sample_rate, training=False, load_teacher=False)
+        if args.smoke else PairedAudioDataset(args.manifest, model.config.supported_sample_rates, training=False, load_teacher=False)
     )
     exits = tuple(int(value.strip()) for value in args.exits.split(",")) if args.exits else None
-    report = evaluate_dataset(model, dataset, exits, args.stream, args.chunk_samples, args.check_clean)
+    settings = json.loads(Path(args.metrics_config).read_text()) if args.metrics_config else {}
+    if not isinstance(settings, dict):
+        parser.error("--metrics-config must contain a JSON object")
+    quality = QualityEvaluator([name.strip() for name in args.metrics.split(",") if name.strip()], args.device, settings)
+    lookaheads = tuple(int(value.strip()) for value in args.lookaheads.split(","))
+    report = evaluate_dataset(model, dataset, exits, args.stream, args.chunk_samples, args.check_clean,
+                              quality_evaluator=quality, lookaheads=lookaheads)
     report["checkpoint"] = str(Path(args.checkpoint).resolve())
     report["data_kind"] = "synthetic_smoke_not_quality_evidence" if args.smoke else "user_supplied_paired_manifest"
     if args.manifest:
@@ -153,7 +235,7 @@ def main() -> None:
     destination = Path(args.output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(f"Saved signal metrics for {len(dataset)} examples to {destination}")
+    print(f"Saved requested metrics for {len(dataset)} examples to {destination}")
 
 
 if __name__ == "__main__":

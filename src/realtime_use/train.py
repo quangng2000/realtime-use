@@ -14,7 +14,7 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.types import RunMode
 from hydra.utils import to_absolute_path
 import lightning as L
-from lightning.pytorch.callbacks import Callback, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import DictConfig, OmegaConf
@@ -79,7 +79,8 @@ def checkpoint_callbacks(settings: dict[str, Any]) -> tuple[RunArtifacts, list[M
         every_n_train_steps=training["checkpoint_every"] * count,
         every_n_epochs=0, save_on_train_epoch_end=False)
     best = ModelCheckpoint(dirpath=directory, filename="best",
-        monitor="validation_mean_clean_loss", mode="min", save_top_k=1,
+        monitor="validation_mean_" + settings.get("validation", {}).get("monitor", "clean_loss"),
+        mode="max" if settings.get("validation", {}).get("monitor") == "utmos" else "min", save_top_k=1,
         enable_version_counter=False, every_n_train_steps=0, every_n_epochs=1,
         save_on_train_epoch_end=False)
     return RunArtifacts(periodic), [periodic, best]
@@ -90,7 +91,7 @@ def restore_legacy_best_score(settings: dict[str, Any], checkpoint: dict[str, An
     """Import the old selector once; subsequent ranking belongs to Lightning."""
     states = checkpoint.get("callbacks", {})
     legacy = states.get("TrainingCheckpoints", {})
-    if (not settings.get("resume") or best.state_key in states
+    if (best.monitor != "validation_mean_clean_loss" or not settings.get("resume") or best.state_key in states
             or legacy.get("best_score") is None):
         return
     directory = Path(best.dirpath).resolve()
@@ -106,27 +107,78 @@ def restore_legacy_best_score(settings: dict[str, Any], checkpoint: dict[str, An
     best.load_state_dict(state)
 
 
+def convergence_callbacks(settings: dict[str, Any]) -> list[EarlyStopping]:
+    """Optional library convergence control; patience is an experiment choice."""
+    validation = settings.get("validation", {})
+    options = validation.get("early_stopping", {})
+    patience = options.get("patience")
+    if patience is None:
+        return []
+    return [EarlyStopping(monitor="validation_mean_" + validation.get("monitor", "clean_loss"),
+                          mode="max" if validation.get("monitor") == "utmos" else "min",
+                          patience=patience, min_delta=float(options.get("min_delta", 0)),
+                          check_finite=True, check_on_train_epoch_end=False, strict=True)]
+
+
 def prepare_config(cfg: DictConfig | dict[str, Any]) -> dict[str, Any]:
     settings = OmegaConf.to_container(OmegaConf.create(cfg), resolve=True, throw_on_missing=True)
     settings = copy.deepcopy(settings)
+    validation = settings.setdefault("validation", {})
+    validation.setdefault("monitor", "clean_loss")
+    validation.setdefault("metrics", [])
+    validation.setdefault("lookaheads", None)
+    validation.setdefault("quality", {})
     if settings.get("smoke", False):
         settings["model"].update(depth=1, exits=[1], width=4, state_dim=2, expand=1,
-                                  decoder_mode="shared", codec_impl="legacy", mixer_impl="legacy", scan_backend="reference")
+                                  decoder_mode="shared", codec_impl="legacy", mixer_impl="legacy", scan_backend="reference",
+                                  sample_rates=[], lookahead_frames=[0], window_type="sqrt_hann")
         settings["training"].update(steps=min(3, int(settings["training"]["steps"])),
             batch_size=1, crop_seconds=0.08, workers=0, grad_accum=1,
             split_decoders_at=None, checkpoint_every=1, log_every=1,
-            validate_every=1, validation_batches=1)
+            validate_every=1, validation_batches=1, sample_lookahead=False, lookahead=0)
         settings["loss"].update(fft_sizes=[64, 128], kd=0.0)
         settings["adversarial"].update(channels=4, scales=2, implementation="legacy")
         settings["data"]["smoke"] = True
+        validation.update(monitor="clean_loss", metrics=[], lookaheads=[0], quality={})
         settings["trainer"]["precision"] = "32-true"
         torch.set_num_threads(1)
-    ModelConfig.from_dict(settings["model"])
+    model = ModelConfig.from_dict(settings["model"])
     training = settings["training"]
-    for key in ("steps", "grad_accum", "checkpoint_every", "validate_every", "validation_batches", "log_every"):
+    training.setdefault("sample_lookahead", False)
+    training.setdefault("lookahead", 0)
+    for key in ("steps", "grad_accum", "checkpoint_every", "validate_every", "log_every"):
         value = training[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"training.{key} must be a positive integer")
+    batches = training.get("validation_batches")
+    if batches is not None and (isinstance(batches, bool) or not isinstance(batches, int) or batches <= 0):
+        raise ValueError("training.validation_batches must be a positive integer or null for the complete set")
+    if not isinstance(training["sample_lookahead"], bool):
+        raise ValueError("training.sample_lookahead must be boolean")
+    if (isinstance(training["lookahead"], bool) or not isinstance(training["lookahead"], int)
+            or training["lookahead"] not in model.lookahead_frames):
+        raise ValueError("training.lookahead must select a configured lookahead branch")
+    if validation["monitor"] not in {"clean_loss", "utmos"}:
+        raise ValueError("validation.monitor must be clean_loss or utmos")
+    if validation["metrics"] not in ([], ["utmos"]):
+        raise ValueError("Training validation.metrics supports [] or [utmos]; use evaluate for the full metric suite")
+    if validation["monitor"] == "utmos":
+        if "utmos" not in validation["metrics"]:
+            raise ValueError("UTMOS checkpoint selection requires validation.metrics=[utmos]")
+        if not settings["data"].get("validation_manifest"):
+            raise ValueError("UTMOS checkpoint selection requires data.validation_manifest")
+        if not settings["data"].get("validation_full_utterance", False):
+            raise ValueError("UTMOS checkpoint selection requires data.validation_full_utterance=true")
+    stopping = validation.get("early_stopping", {})
+    patience = stopping.get("patience")
+    if patience is not None:
+        if isinstance(patience, bool) or not isinstance(patience, int) or patience < 1:
+            raise ValueError("validation.early_stopping.patience must be a positive validation-check count or null")
+        delta = stopping.get("min_delta", 0.0)
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not 0 <= delta < float("inf"):
+            raise ValueError("validation.early_stopping.min_delta must be finite and nonnegative")
+        if not settings["data"].get("validation_manifest") and not settings["data"].get("smoke"):
+            raise ValueError("Early stopping requires a validation dataset")
     if training["stage"] not in {"regression", "adversarial"}:
         raise ValueError("training.stage must be regression or adversarial")
     if settings.get("resume") and settings.get("init_from"):
@@ -200,9 +252,10 @@ def _checkpoint_config(settings: dict[str, Any], checkpoint: dict[str, Any]) -> 
         # Changing optimizer structure/objective mid-resume is a fresh experiment.
         for group in ("loss", "adversarial"):
             old_group, new_group = dict(previous.get(group, {})), dict(settings[group])
-            if group in {"loss", "adversarial"}:
-                old_group.setdefault("implementation", "legacy")
-                new_group.setdefault("implementation", "legacy")
+            old_group.setdefault("implementation", "legacy")
+            new_group.setdefault("implementation", "legacy")
+            old_group.setdefault("sample_rate_scaling", False)
+            new_group.setdefault("sample_rate_scaling", False)
             if group == "adversarial":
                 # Newly introduced, inactive knobs must not prevent old critic
                 # checkpoints from resuming with their original architecture.
@@ -212,12 +265,13 @@ def _checkpoint_config(settings: dict[str, Any], checkpoint: dict[str, Any]) -> 
                         values.pop(key, None)
             if group in previous and old_group != new_group:
                 raise ValueError(f"resume must preserve {group}; use init_from for a fresh experiment")
-        for key in ("lr", "weight_decay", "grad_accum", "predecoder_lr_scale", "sample_exit", "split_decoders_at"):
+        for key in ("lr", "weight_decay", "grad_accum", "predecoder_lr_scale", "sample_exit", "split_decoders_at",
+                    "sample_lookahead", "lookahead"):
             old = previous.get("training", {})
             if key in old and old[key] != settings["training"].get(key):
                 raise ValueError(f"resume must preserve training.{key}; use init_from to change it")
-    elif settings["training"]["stage"] == "adversarial" and checkpoint.get("stage") != "regression":
-        raise ValueError("Adversarial init_from requires a regression checkpoint")
+    elif settings["training"]["stage"] == "adversarial" and checkpoint.get("stage") not in {"regression", "adversarial"}:
+        raise ValueError("Adversarial init_from requires a regression or adversarial enhancement checkpoint")
 
 
 def run_training(cfg: DictConfig | dict[str, Any]) -> Path:
@@ -247,9 +301,10 @@ def run_training(cfg: DictConfig | dict[str, Any]) -> Path:
         default_root_dir=str(destination),
         max_steps=training["steps"] * optimizer_count, max_epochs=-1,
         accumulate_grad_batches=1, enable_checkpointing=True, use_distributed_sampler=False,
-        callbacks=[artifacts, *checkpoints], logger=CSVLogger(str(destination), name="metrics"),
+        callbacks=[artifacts, *checkpoints, *convergence_callbacks(settings)], logger=CSVLogger(str(destination), name="metrics"),
         log_every_n_steps=training["log_every"],
-        limit_val_batches=training["validation_batches"] if data.has_validation else 0,
+        limit_val_batches=(1.0 if training["validation_batches"] is None else training["validation_batches"])
+                          if data.has_validation else 0,
         val_check_interval=training["validate_every"] * training["grad_accum"],
         check_val_every_n_epoch=None)
     trainer.fit(module, datamodule=data, ckpt_path=settings.get("resume"))

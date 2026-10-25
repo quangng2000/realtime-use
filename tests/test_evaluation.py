@@ -167,3 +167,56 @@ def test_official_checkpoint_does_not_silently_change_architecture_for_cpu(tmp_p
     torch.save({"model_config": config.to_dict(), "model_state": {}}, path)
     with pytest.raises(RuntimeError, match="Official Mamba checkpoints require CUDA"):
         load_model(path, "cpu")
+
+
+def test_quality_native_rates_lookaheads_and_full_valid_utterances(monkeypatch):
+    model = ScaleModel()
+    model.config.supported_sample_rates = (16000, 48000)
+    model.config.lookahead_frames = (0, 1, 2)
+    calls = []
+    def enhance(model, wave, depth, streaming, chunk_samples, sample_rate=None, lookahead=0):
+        calls.append((wave.numel(), sample_rate or 16000, depth, lookahead))
+        return (wave * .5)[None]
+    monkeypatch.setattr("realtime_use.evaluate.enhance_waveform", enhance)
+    class Scorer:
+        metrics = ("utmos",)
+        metadata = {"utmos": {"backend": "mock contract; not quality evidence"}}
+        backends = {}
+        def score(self, estimate, reference, sample_rate, **kwargs):
+            assert estimate.ndim == reference.ndim == 1
+            assert estimate.shape == reference.shape
+            assert kwargs["transcript"] == "sample"
+            return {"utmos": float(estimate.mean())}
+    dataset = [{"noisy": torch.ones(20), "clean": torch.ones(20) * .5,
+                "length": 13, "id": str(rate), "sample_rate": rate, "transcript": "sample"}
+               for rate in (16000, 48000)]
+    result = evaluate_dataset(model, dataset, exits=(1,), lookaheads=(0, 1, 2), quality_evaluator=Scorer())
+    assert result["sample_rate"] is None
+    assert result["sample_rates"] == [16000, 48000]
+    assert len(calls) == 6 and all(call[0] == 13 for call in calls)
+    assert set(call[1] for call in calls) == {16000, 48000}
+    assert set(call[3] for call in calls) == {0, 1, 2}
+    assert result["summary"]["exits"]["1"]["quality"]["utmos"]["mean"] == .5
+    assert result["summary"]["bypass"]["quality"]["utmos"]["mean"] == 1
+    assert result["summary_by_sample_rate"]["48000"]["by_lookahead"]["2"]["exits"]["1"]["utterances"] == 1
+    assert result["quality_metric_implementations"] == Scorer.metadata
+    json.dumps(result, allow_nan=False)
+
+
+def test_evaluation_rejects_unconfigured_rate_and_lookahead():
+    model = ScaleModel()
+    item = {"noisy": torch.ones(8), "clean": torch.ones(8), "sample_rate": 48000}
+    with pytest.raises(ValueError, match="sample rate"):
+        evaluate_dataset(model, [item])
+    with pytest.raises(ValueError, match="lookaheads"):
+        evaluate_dataset(model, [item], lookaheads=(1,))
+
+
+def test_cacc_corpus_aggregation_weights_reference_character_counts():
+    from realtime_use.evaluate import summarize_quality
+    rows = [{"quality": {"cacc": .5}, "cacc_reference_characters": 2},
+            {"quality": {"cacc": 1.0}, "cacc_reference_characters": 8}]
+    result = summarize_quality(rows)["cacc"]
+    assert result["mean"] == .75
+    assert result["corpus_character_accuracy"] == .9
+    assert result["reference_characters"] == 10

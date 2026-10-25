@@ -1,5 +1,6 @@
 train_manifest: null
 validation_manifest: null
+validation_full_utterance: false
 pin_memory: false
 smoke: false
 augmentation:

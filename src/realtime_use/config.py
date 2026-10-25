@@ -22,9 +22,14 @@ class ModelConfig:
     codec_impl: str = "legacy"
     mixer_impl: str = "legacy"
     scan_backend: str = "reference"
+    sample_rates: tuple[int, ...] = ()
+    lookahead_frames: tuple[int, ...] = (0,)
+    window_type: str = "sqrt_hann"
 
     def __post_init__(self) -> None:
         self.exits = tuple(self.exits)
+        self.sample_rates = tuple(self.sample_rates)
+        self.lookahead_frames = tuple(self.lookahead_frames)
         for name in ("sample_rate", "depth", "width", "state_dim", "expand", "conv_kernel"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -33,10 +38,22 @@ class ModelConfig:
             raise ValueError("window_ms and hop_ms must be positive")
         if abs(self.window_ms - 2 * self.hop_ms) > 1e-6:
             raise ValueError("This baseline supports window_ms = 2 * hop_ms")
-        for ms in (self.window_ms, self.hop_ms):
-            samples = self.sample_rate * ms / 1000
-            if abs(samples - round(samples)) > 1e-6:
-                raise ValueError("Window and hop must correspond to integer samples")
+        if (any(isinstance(rate, bool) or not isinstance(rate, int) or rate <= 0 for rate in self.sample_rates)
+                or self.sample_rates != tuple(sorted(set(self.sample_rates)))):
+            raise ValueError("sample_rates must be unique increasing positive integers")
+        if self.sample_rate not in self.supported_sample_rates:
+            raise ValueError("sample_rates must include the default sample_rate")
+        for rate in self.supported_sample_rates:
+            for ms in (self.window_ms, self.hop_ms):
+                samples = rate * ms / 1000
+                if abs(samples - round(samples)) > 1e-6:
+                    raise ValueError("Window and hop must correspond to integer samples at every configured rate")
+        if (not self.lookahead_frames or self.lookahead_frames != tuple(sorted(set(self.lookahead_frames)))
+                or any(isinstance(ahead, bool) or not isinstance(ahead, int) or ahead not in (0, 1, 2)
+                       for ahead in self.lookahead_frames)):
+            raise ValueError("lookahead_frames must be a nonempty increasing subset of (0, 1, 2)")
+        if self.window_type not in {"hann", "sqrt_hann"}:
+            raise ValueError("window_type must be hann or sqrt_hann")
         if not self.exits or self.exits != tuple(sorted(set(self.exits))):
             raise ValueError("exits must be nonempty, unique, and increasing")
         if any(isinstance(x, bool) or not isinstance(x, int) or not 1 <= x <= self.depth for x in self.exits):
@@ -45,6 +62,8 @@ class ModelConfig:
             raise ValueError("decoder_mode must be shared or per_exit")
         if self.codec_impl not in {"legacy", "nemotron_causal"}:
             raise ValueError("codec_impl must be legacy or nemotron_causal")
+        if self.codec_impl == "legacy" and self.lookahead_frames != (0,):
+            raise ValueError("Nonzero lookahead requires codec_impl=nemotron_causal")
         if self.mixer_impl not in {"legacy", "mamba_ssm"}:
             raise ValueError("mixer_impl must be legacy or mamba_ssm")
         if self.scan_backend not in {"reference", "auto", "mamba_ssm"}:
@@ -63,7 +82,13 @@ class ModelConfig:
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
         result["exits"] = list(self.exits)
+        result["sample_rates"] = list(self.sample_rates)
+        result["lookahead_frames"] = list(self.lookahead_frames)
         return result
+
+    @property
+    def supported_sample_rates(self) -> tuple[int, ...]:
+        return self.sample_rates or (self.sample_rate,)
 
 
 def load_config(path: str | Path) -> dict[str, Any]:

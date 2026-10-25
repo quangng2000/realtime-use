@@ -21,12 +21,16 @@ structure. Both this release and the real-time recipe select `relu_log1p`:
 the adapter uses `log1p(abs(spectrum))` at its input and `expm1(ReLU(mapped))`
 at its output, following the commercial release's `models/stfts.py`.
 
-Only zero lookahead is implemented. This adapter is not an exact reproduction of
-the real-time paper's three parallel lookahead input branches. Its convolution
-caches are external per-stream dictionaries; full-sequence training and one-frame
-inference call the same upstream `forward` methods. Two zero frequency bins are
-appended at the encoder boundary, then the decoder output is cropped to the
-original bin count, including even bin counts. No future time padding is added.
+When configured, the first convolution has independent branches for lookahead
+0, 1 and 2. Full-sequence execution controls left/right padding in that layer;
+streaming delays downstream computation until the selected future frames arrive
+and drains pending outputs at end-of-stream. Remaining temporal convolutions
+use only past context. Single-branch configurations retain the older parameter
+layout. Convolution caches are external per-stream dictionaries; full-sequence
+training and one-frame inference call the same upstream `forward` methods. Two
+zero frequency bins are appended at the encoder boundary and decoded output is
+cropped to the original bin count, including even counts. These adaptations are
+local and do not import NVIDIA's separately licensed realtime wrapper.
 
 SHA-256 hashes of the unmodified upstream files:
 

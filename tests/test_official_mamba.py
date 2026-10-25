@@ -168,6 +168,7 @@ def test_official_cuda_enhancer_reload_streaming_and_export(official_cuda, decod
     assert saved["verification"]["device"].startswith("cuda")
 
 
+@pytest.mark.training_loop
 def test_official_cuda_native_regression_gan_and_resume_preflight(official_cuda, tmp_path):
     """Synthetic execution preflight on the real backend, without a quality claim."""
     from hydra import compose, initialize_config_module

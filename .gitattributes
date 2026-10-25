@@ -1,3 +1,5 @@
 # Preserve the exact upstream bytes checked by source-provenance tests.
 src/realtime_use/_vendor/nemotron_codec/codec_module_time_d4.py -text whitespace=-blank-at-eol
 src/realtime_use/_vendor/nemotron_codec/LICENSE -text whitespace=cr-at-eol,-blank-at-eof
+src/realtime_use/_vendor/espnet_detection/__init__.py -text whitespace=-blank-at-eof
+src/realtime_use/_vendor/espnet_detection/LICENSE -text

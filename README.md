@@ -1,12 +1,14 @@
 # realtime-use
 
-A PyTorch research training project for causal speech enhancement with **4, 8, or 12 time–frequency blocks**, using **official `mamba_ssm.Mamba` blocks**, a **licensed NVIDIA codec adapted for streaming**, **DAC spectral discriminators**, **PyTorch Lightning**, and **Hydra**. The first target is mono 16 kHz audio with a 40 ms analysis window, a 20 ms hop, and zero look-ahead.
+A PyTorch research training project for causal speech enhancement with **4, 8, or 12 time–frequency blocks**, using **official `mamba_ssm.Mamba` blocks**, a **licensed NVIDIA codec adapted for streaming**, **DAC spectral discriminators**, **PyTorch Lightning**, and **Hydra**. Fixed-depth baselines use mono 16 kHz audio, a 40 ms Hann analysis window, a 20 ms hop, and zero lookahead. The `paper_flexible12` profile supports seven native rates and independently parameterized lookahead branches 0, 1, and 2.
 
 The project uses the methods in [One Model, Many Latencies](https://arxiv.org/abs/2606.25621) and [Rethinking Training Targets, Architectures and Data Quality](https://arxiv.org/abs/2603.02641) as research references. It does not download or include NVIDIA checkpoints or restricted model source code. Models start from random initialization unless you explicitly supply your own compatible checkpoint.
 
 New presets reuse NVIDIA's [NemotronLabs RE-USE codec source under OpenMDW-1.1](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-RE-USE/tree/31f82f2efad1095034492f236e8dac9239ba713b) and [Descript DAC's MIT-licensed multiband STFT critic](https://github.com/descriptinc/descript-audio-codec/blob/c7cfc5d2647e26471dc394f95846a0830e7bec34/dac/model/discriminator.py). The original codec source and license are retained unchanged; a small adapter applies the paper's causal changes. This is separate from the noncommercial Real-time RE-USE release. See [source provenance](docs/provenance.md) and [remaining paper differences](docs/method.md).
 
-**Status:** a training and streaming baseline for experiments. It is not an exact reproduction of either paper, a pretrained enhancement product, or evidence of published quality or latency. The complete URGENT degradation pipeline, sample-rate-independent training, and adjustable look-ahead remain future work. The official Mamba path requires CUDA; the earlier independent mixer remains an explicitly selected legacy CPU baseline. Deployment speed must be measured on the intended hardware.
+**Status:** a training and streaming baseline for experiments. It is not an exact reproduction of either paper, a pretrained enhancement product, or evidence of published quality or latency. Native multi-rate transforms and batching, parallel lookahead branches, and streaming delay/flush are implemented. The full URGENT degradation mixture, exact author losses/critics/schedule, and published quality remain unverified. The official Mamba path requires CUDA; the earlier independent mixer remains an explicitly selected legacy CPU baseline. Deployment speed must be measured on the intended hardware.
+
+No training or optimizer updates have been launched for this parity update. Training commands below are instructions for a later run, not completed experiments.
 
 ## Set up
 
@@ -18,7 +20,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install torch==2.7.1 torchaudio==2.7.1
 python -m pip install -e '.[test,augmentation,gan]'
-python -m pytest -q
+python -m pytest -q --no-training
 ```
 
 For a CPU-only PyTorch install, install the appropriate wheel first:
@@ -28,7 +30,7 @@ python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://downloa
 python -m pip install -e '.[test,augmentation,gan]'
 ```
 
-The CPU reference backend needs neither a paid GPU nor a pretrained model. The CI workflow is configured to test that path on Ubuntu with Python 3.11 and 3.12.
+The CPU reference backend needs neither a paid GPU nor a pretrained model. Push and pull-request CI uses `--no-training` on Ubuntu with Python 3.11 and 3.12. It runs forward/backward, inference, validation, data and metric checks while skipping explicitly marked optimizer/training-loop cases. Test-process guards also block `Trainer.fit`, optimizer updates and known child training launchers if an unmarked test reaches them. A manual workflow dispatch runs the full suite only when `run_training_tests=true` is explicitly selected.
 
 For training with official Mamba, first configure a compatible Linux CUDA PyTorch and build environment, then install the optional dependencies (see the versioned recipe in [training.md](docs/training.md)):
 
@@ -36,13 +38,13 @@ For training with official Mamba, first configure a compatible Linux CUDA PyTorc
 python -m pip install -e '.[cuda,gan]' --no-build-isolation
 ```
 
-All four Hydra model presets select `model.mixer_impl=mamba_ssm`: the complete official Mamba-1 block, including parameter initialization, sequence processing, and recurrent inference. This architecture never falls back to the custom mixer. `model.scan_backend=auto` is retained for configuration compatibility; changing scan kernels applies only to `model.mixer_impl=legacy`. CPU smoke tests select that legacy architecture explicitly. CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
+The Hydra model presets select `model.mixer_impl=mamba_ssm`: the complete official Mamba-1 block, including parameter initialization, sequence processing, and recurrent inference. This architecture never falls back to the custom mixer. `model.scan_backend=auto` is retained for configuration compatibility; changing scan kernels applies only to `model.mixer_impl=legacy`. CPU smoke tests select that legacy architecture explicitly. CUDA kernel compatibility, mixed-precision behavior, GPU training throughput, and GPU latency still need measurements on the actual environment.
 
 Checkpoints without `mixer_impl` are treated as legacy. To resume them, explicitly set `model.mixer_impl=legacy`; they cannot initialize or resume an official-Mamba run by renaming keys. Official checkpoints require `--device cuda` for inference, evaluation, benchmarking, and export. CPU/phone execution of that architecture remains future work.
 
-The current model presets also select `model.codec_impl=nemotron_causal`. The author dense encoder consumes log-magnitude and phase, reduces frequency resolution by two, and feeds temporal-then-frequency Mamba blocks. Separate mapped-magnitude and phase decoders replace the earlier complex-residual head. Missing `codec_impl` identifies the earlier codec; select `model.codec_impl=legacy` to load those runs. Codec changes require fresh training and are rejected during checkpoint initialization/resume.
+The current model presets also select `model.codec_impl=nemotron_causal`. The author dense encoder consumes log-magnitude and phase, reduces frequency resolution by two, and feeds temporal-then-frequency Mamba blocks. Separate mapped-magnitude and phase decoders replace the earlier complex-residual head. Missing `codec_impl` identifies the earlier codec; select `model.codec_impl=legacy` to load those runs. Codec changes require fresh training and are rejected during checkpoint initialization/resume. New presets use `window_type=hann`. Checkpoints missing `sample_rates`, `lookahead_frames`, or `window_type` keep the previous single-rate, zero-lookahead, square-root-Hann behavior and parameter layout.
 
-The trainer supports one device or PyTorch DDP for regression and adversarial training. The integration suite exercises two CPU/Gloo processes, gradient accumulation, decoder transitions, checkpoint resume, and comparison with an equivalent single-process batch. CUDA/NCCL correctness, memory use, and scaling still require GPU validation.
+The trainer supports one device or PyTorch DDP for regression and adversarial training. Opt-in lifecycle tests cover two CPU/Gloo processes, gradient accumulation, decoder transitions, checkpoint resume, and comparison with an equivalent single-process batch. Earlier CPU/Gloo results are historical coverage; these optimizer/training-loop cases are excluded from the current no-training run and default CI. CUDA/NCCL correctness, memory use, and scaling still require GPU validation.
 
 ## Prepare your data
 
@@ -54,7 +56,7 @@ Each JSONL row has paths relative to the manifest and an explicit sample rate:
 {"noisy":"noisy/example.wav","clean":"clean/example.wav","sample_rate":16000}
 ```
 
-The two recordings must be mono, have the same sample rate and length, and already be aligned. The initial dataset loader rejects other rates instead of silently resampling. Keep validation speakers and recordings separate from training.
+The two recordings must be mono, have the same sample rate and length, and already be aligned. A fixed-rate preset rejects other rates instead of silently resampling. The multi-rate profile accepts the configured native rates and groups each batch by rate; it never mixes unlike sample grids in one batch. Keep validation speakers and recordings separate from training.
 
 Optional training corruption uses `audiomentations` for Gaussian noise, clipping, and low-pass filtering. Install `.[augmentation]` and set `data.augmentation.enabled=true`; see [the data contract](data/README.md#targets-and-synthetic-degradations) for ranges, alignment, and cached-teacher restrictions. It is disabled by default and does not implement the full URGENT data pipeline.
 
@@ -124,7 +126,7 @@ Hydra `-m` with a distributed job is currently rejected; launch each DDP experim
 
 The regression loss combines PyTorch waveform L1 with `auraloss` multi-resolution spectral convergence and log-magnitude losses. A small adapter crops each utterance to its valid length and gives utterances equal weight. These are explicitly configured objectives, not a verified copy of the papers' loss implementation. The old custom loss is retained only as `loss.implementation=legacy` for prior experiments; native resume must preserve the objective.
 
-The trainer writes a native Lightning checkpoint at `checkpoints/last.ckpt` inside the run's output directory. With a validation manifest, it can select `checkpoints/best.ckpt` using held-out reconstruction loss averaged over exits. Validation uses fixed crops and the configured validation limit; this selection metric is not UTMOS, a listening-test result, or a full official benchmark.
+The trainer writes a native Lightning checkpoint at `checkpoints/last.ckpt` inside the run's output directory. Baseline presets select `checkpoints/best.ckpt` by held-out reconstruction loss using their configured crop and batch limit. The `paper_flexible12` profile instead maximizes UTMOS22 strong on full validation utterances and all batches. It evaluates every configured exit/lookahead combination with equal utterance weighting. This requires explicit local metric assets; see [metric setup and limitations](docs/metrics.md).
 
 ## Add adversarial fine-tuning
 
@@ -141,7 +143,7 @@ python -m realtime_use.train \
   output_dir=runs/fixed4-adversarial
 ```
 
-Install the `gan` extra before this stage. Use matching PyTorch and torchaudio builds; the tested setup is documented in [training.md](docs/training.md#official-mamba-cuda-environment). The default `adversarial.implementation=dac_mrd` imports the original DAC `MRD` at FFT sizes 512, 1024 and 2048, with approximately 4 kHz bands. It does not enable DAC's periodic critics or waveform peak normalization.
+Install the `gan` extra before this stage. Use matching PyTorch and torchaudio builds; the tested setup is documented in [training.md](docs/training.md#official-mamba-cuda-environment). The default `adversarial.implementation=dac_mrd` imports DAC spectral critics at FFT sizes 512, 1024 and 2048 for the reference rate, with approximately 4 kHz bands. The multi-rate profile scales FFT sizes with rate and shares corresponding lower-frequency critic weights; its complete set of band modules is registered before distributed setup. It does not enable DAC's periodic critics or waveform peak normalization.
 
 Here the enhancement network remains trainable, with hinge-GAN and feature-matching losses in addition to clean-reference reconstruction. Inference still uses one enhancement network. Teacher tensors are ignored in this stage. The DAC critic is a documented approximation to the family cited by RE-USE; the exact real-time critic and loss recipe are not available in the reviewed releases. Legacy critics remain available through `adversarial.implementation=legacy` for older runs.
 
@@ -166,25 +168,62 @@ python -m realtime_use.train \
 
 Knowledge distillation during regression training is optional and disabled initially. If enabled later, it uses explicitly supplied cached teacher outputs with documented permissions; neither training stage fetches or runs a teacher automatically.
 
+## Multi-rate and lookahead profile
+
+Inspect the profile without initializing a training loop:
+
+```bash
+python -m realtime_use.train experiment=paper_flexible12 --cfg job --resolve
+```
+
+It retains the requested exits **4/8/12**, supports **8/16/22.05/24/32/44.1/48 kHz**, and samples one exit and one lookahead setting per training microbatch. The input branches have separate parameters. The profile uses Hann windows, rate-scaled spectral losses and critics, full-utterance validation with no batch cap, and UTMOS22-strong checkpoint selection. Its nine exit/lookahead settings are a subset of the paper's thirty settings from exits 3–12.
+
+Before a later run, provide aligned native-rate manifests and the local UTMOS source/checkpoint paths documented in [metrics.md](docs/metrics.md). No metric model is downloaded automatically. The decoder split is deliberately unset in this profile: choose its timing after reviewing convergence rather than treating the baseline's 50,000-update example as an author schedule. Changing that schedule uses `init_from` for a new run with fresh optimizer/update state; native `resume` preserves the original schedule. Regression-to-adversarial and shared-to-per-exit are separate stage choices.
+
+Check the prepared profile without a training loop or optimizer updates:
+
+```bash
+python -m realtime_use.preflight \
+  experiment=paper_flexible12 \
+  data.train_manifest=/absolute/path/to/native-rate-train.jsonl \
+  data.validation_manifest=/absolute/path/to/native-rate-validation.jsonl \
+  validation.quality.utmos.repo=/absolute/path/to/SpeechMOS-v1.2.0 \
+  validation.quality.utmos.checkpoint=/absolute/path/to/utmos22_strong_step7459_v1.pt \
+  trainer.accelerator=gpu trainer.devices=1
+```
+
+`realtime-use-preflight` is the equivalent installed command. It checks dataset setup and local metric assets, constructs the actual configured model, and compares short FP32 full/streaming outputs across every configured rate, exit and lookahead. It reports active parameter counts and CUDA peak allocation. It does not train, establish quality, or validate AMP, NCCL, training memory or throughput.
+
+At inference, select a rate already listed in `model.sample_rates` and a trained `lookahead` branch. The Python interfaces are:
+
+```python
+from realtime_use.audio import StreamingEnhancer
+
+outputs = model.enhance(waveform, exit_depths=(4,), sample_rate=22050, lookahead=1)
+stream = StreamingEnhancer(model, exit_depth=4, sample_rate=22050, lookahead=1)
+```
+
+Keep one stream object per recording, concatenate `push()` outputs, and call `flush()` once. Lookahead delays the initial output and is fully drained at the end; it does not discard the tail. Algorithmic latency is **40 + 20 × lookahead ms**, before compute and device buffering. Changing the rate or branch mid-stream requires a new stream/reset.
+
 ## Export a small inference checkpoint
 
-After training a flexible model, extract one of its trained exits:
+After training a flexible model, extract one of its trained exits and lookahead branches:
 
 ```bash
 python -m realtime_use.export \
-  --checkpoint runs/flexible12-regression/checkpoints/last.ckpt \
-  --exit-depth 4 \
+  --checkpoint runs/paper-flexible12-regression/checkpoints/last.ckpt \
+  --exit-depth 4 --lookahead 1 \
   --device cuda \
   --output runs/export/exit4.pt
 ```
 
-This retains the encoder, first four blocks, and the matching trained decoder. It removes the deeper blocks, other decoder heads, and training optimizer/discriminator state. The resulting inference checkpoint can be used by the inference and benchmark commands below. Selecting an exit at runtime alone does not remove the unused weights from a full model's checkpoint.
+This retains the selected input branch, first four blocks, and matching decoder. It removes unused input branches, deeper blocks, other decoder heads, and training optimizer/discriminator state. All trained rates are retained by default; add `--sample-rate 16000 --single-rate` to restrict the export to one native rate. The resulting inference checkpoint can be used by the inference and benchmark commands below. Selecting an exit at runtime alone does not remove the unused weights from a full model's checkpoint.
 
-Export verifies full/streaming output equivalence on a short deterministic sample on the selected device and refuses to overwrite an existing destination. Official Mamba export uses CUDA; legacy CPU export uses `--device cpu`. This is a structural correctness check, not a quality or speed benchmark. Exported checkpoints are for inference; preserve the original training checkpoint for resuming training.
+Export verifies full/streaming output equivalence at every retained rate on short deterministic samples on the selected device and refuses to overwrite an existing destination. Official Mamba export uses CUDA; legacy CPU export uses `--device cpu`. This is a structural correctness check, not a quality or speed benchmark. Exported checkpoints are for inference; preserve the original training checkpoint for resuming training.
 
 ## Enhance and evaluate audio
 
-Use a checkpoint from your own run. Input must be mono and match its configured sample rate.
+Use a checkpoint from your own run. Input must be mono and use a rate supported by that checkpoint. Inference reads the file rate without resampling; `--sample-rate` can require a particular native rate. `--lookahead` selects a trained branch; when omitted by the inference/benchmark CLI it selects the smallest retained branch. Python calls retain `lookahead=0` as their default, so pass `lookahead=1` or `2` explicitly for an export containing only that branch.
 
 Native Lightning `.ckpt` files retain `model_config` and `model_state` compatibility fields for these existing tools. Inference, evaluation, export, and benchmarking keep their flag-based interfaces; the Hydra migration applies to training.
 
@@ -216,17 +255,11 @@ python -m realtime_use.benchmark \
   --device cuda --threads 1
 ```
 
-The benchmark uses synthetic timing input unless `--input` supplies a recording. Its timing results do not establish enhancement quality. Increase the measurement duration for a deployment decision and repeat on the actual target hardware.
+For multi-rate/lookahead timing, add `--sample-rate 22050 --lookahead 1` or provide a native-rate `--input`. The benchmark reports algorithmic latency and observed input duration before the first output, in addition to per-hop processing time. The benchmark uses synthetic timing input unless `--input` supplies a recording. Its timing results do not establish enhancement quality. Increase the measurement duration for a deployment decision and repeat on the actual target hardware.
 
 ## Measure before scaling
 
-The earlier **legacy codec and mixer** with width 64, expansion 4, and state dimension 16 have these measured active parameter counts. They do not describe the new author-codec/official-Mamba presets:
-
-- Four-block exit: **863,426**.
-- Eight-block exit: **1,687,746**.
-- Twelve-block exit: **2,512,066**.
-
-An enhancement-only legacy flexible 12-block model stores 2,512,066 parameters with a shared decoder and 2,586,438 with three per-exit decoders. Active counts include one selected decoder. The Lightning training module/checkpoint can additionally retain transition heads, discriminators, and optimizer state; these inference-model counts are not its total memory footprint. Measure the official-Mamba architecture in an environment with that dependency installed:
+No official-Mamba parameter count or hardware timing has been measured for the assembled multi-rate/lookahead model in this update. Obtain counts from the actual installed class; old legacy counts and the papers' counts are not substitutes:
 
 ```python
 from realtime_use.config import ModelConfig
@@ -234,14 +267,15 @@ from realtime_use.model import Enhancer
 
 model = Enhancer(ModelConfig(depth=12, exits=(4, 8, 12),
                              mixer_impl="mamba_ssm", scan_backend="auto",
-                             codec_impl="nemotron_causal"))
+                             codec_impl="nemotron_causal", lookahead_frames=(0, 1, 2),
+                             window_type="hann"))
 for depth in model.config.exits:
-    print(depth, model.active_parameter_count(depth))
+    print(depth, model.active_parameter_count(depth, lookahead=0))
 ```
 
-The legacy counts above must not be relabeled as the paper's counts or the new model's counts. The new author encoder halves frequency resolution; its separate magnitude/phase heads map directly to a reconstructed spectrum. State memory, compute and quality must be remeasured after this architecture change.
+Active counts include only the selected branch, block prefix and decoder. Stored training checkpoints can additionally contain unused branches/heads, discriminators and optimizer state.
 
-Measure streaming p50/p95/p99 processing time at batch size one on the target machine, including the audio framing path. With a 20 ms hop, sustained processing must fit within 20 ms per hop. The 40 ms analysis window is an algorithmic latency component; audio-device buffering and processing time add to it.
+Measure streaming p50/p95/p99 processing time at batch size one on the target machine, including the audio framing path. With a 20 ms hop, sustained processing must fit within 20 ms per hop. The window plus lookahead (40, 60 or 80 ms) is an algorithmic latency component; audio-device buffering and processing time add to it.
 
 For a training-time estimate, benchmark the intended crop length, sample rate, precision, batch size, and training stage. Multiply measured seconds per generator update by `training.steps`, then add data preparation, validation, and checkpoint overhead. An adversarial update includes both discriminator and generator work. Published inference timing is not a training-throughput benchmark.
 

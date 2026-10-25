@@ -1,0 +1,12 @@
+monitor: clean_loss
+metrics: []
+# null evaluates every configured lookahead at every configured exit.
+lookaheads: null
+early_stopping:
+  # Count validation checks, not epochs. Set explicitly after choosing a pilot recipe.
+  patience: null
+  min_delta: 0.0
+quality:
+  utmos:
+    repo: null
+    checkpoint: null

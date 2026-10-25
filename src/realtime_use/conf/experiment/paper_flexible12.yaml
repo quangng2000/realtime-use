@@ -1,0 +1,27 @@
+# @package _global_
+# Paper architecture/data-interface settings; update budgets and loss weights
+# remain explicit project choices because the full author recipe is unpublished.
+defaults:
+- override /model: flexible12
+model:
+  sample_rates: [8000, 16000, 22050, 24000, 32000, 44100, 48000]
+  lookahead_frames: [0, 1, 2]
+  window_type: hann
+training:
+  sample_exit: true
+  sample_lookahead: true
+  # Split after reviewing convergence, in an explicit continuation stage.
+  split_decoders_at: null
+  validation_batches: null
+data:
+  validation_full_utterance: true
+  pin_memory: true
+loss:
+  sample_rate_scaling: true
+adversarial:
+  sample_rate_scaling: true
+trainer:
+  accelerator: gpu
+validation:
+  monitor: utmos
+  metrics: [utmos]

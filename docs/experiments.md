@@ -1,16 +1,16 @@
 # Experiments and acceptance gates
 
-This roadmap defines what to measure before expanding the training budget or making deployment claims. All numerical targets below are project decisions to be filled or adopted for a specific use case, not reported results from this repository.
+This roadmap defines what to measure before expanding the training budget or making deployment claims. All numerical targets below are project decisions to be filled or adopted for a specific use case, not reported results from this repository. No training or optimizer updates were launched for the current parity update. Later training gates are a proposed workflow, not completed work.
 
 ## 1. Verify the software path
 
-Run the CPU test suite and the tiny synthetic smoke experiment. Verify finite losses, parameter updates, checkpoint save/load, exact paired cropping, and waveform length preservation. Compare streaming and whole-utterance evaluation under the same exit and precision. Reset recurrent state between independent recordings.
+First run the [configured preflight](training.md#preflight-without-training), then forward/backward and inference-only tests without optimizer steps. Preflight loads local assets and checks every configured rate/exit/lookahead on one device in FP32; it does not exercise AMP, NCCL, gradients or optimizer steps. Verify finite outputs/gradients, checkpoint load/export, exact paired cropping, and waveform length preservation. Use `python -m pytest -q --no-training` to skip optimizer/lifecycle cases and activate the test-local guards. Default push/PR CI uses the same mode. The full suite without that flag and the smoke training command contain optimizer/lifecycle tests; run those only when that execution is intended. Compare streaming and whole-utterance evaluation under the same native rate, exit, lookahead and precision. Reset recurrent state between independent recordings.
 
-Before a CUDA run, also verify the optional scan kernel against the reference recurrence and compare gradients at the chosen precision. CPU success does not validate that path. Check that streaming boundary behavior stays stable with learned spectral changes and that persistent state storage remains bounded across long input chunks.
+Before training, verify the actual official Mamba class, full/step outputs and gradients on CUDA at the chosen precision. The independent legacy recurrence is not a substitute for that architecture. CPU success does not validate that path. Check that streaming boundary behavior stays stable with learned spectral changes and that persistent state storage remains bounded across long input chunks.
 
 Passing this gate means the tested implementation paths work. It does not demonstrate speech enhancement quality.
 
-Smoke mode uses a one-block, width-4 network even when given a fixed-depth experiment. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. CPU/Gloo integration tests exercise DDP gradients, accumulation, sampled exits, decoder transitions, resume, and exact validation weighting. CUDA/NCCL and multi-GPU scaling still need GPU measurements. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
+Smoke mode uses a one-block, width-4 network even when given a fixed-depth experiment. Full-size 4-/8-/12-block GPU memory and throughput require separate runs. The opt-in CPU/Gloo integration tests exercise DDP gradients, accumulation, sampled exits, decoder transitions, resume, and exact validation weighting; earlier results are historical coverage and these training-loop tests are excluded from current no-training verification. CUDA/NCCL and multi-GPU scaling still need GPU measurements. The optional CUDA parity test is skipped in a CPU-only environment, so that skip is not CUDA validation.
 
 ## 2. Establish a licensed data pilot
 
@@ -34,11 +34,11 @@ For each run, retain:
 
 - Repository revision, full config, random seed, checkpoint identifier, and data manifest/version.
 - Trainable and per-exit active parameter counts measured from the model.
-- Training sample rate, crop length, batch size, gradient accumulation, precision, optimizer, stage, and generator-update count. In the adversarial stage, Lightning's optimizer-step counter includes both optimizers; do not equate it with generator updates.
+- Configured and sampled native rates, lookahead branches, crop length, batch size, gradient accumulation, precision, optimizer, stage, and generator-update count. In the adversarial stage, Lightning's optimizer-step counter includes both optimizers; do not equate it with generator updates.
 - GPU model/count, peak memory, measured optimizer-step time, wall-clock time, and validation/checkpoint overhead.
 - Held-out waveform/spectral metrics, listening notes, and any separately installed speech-quality or ASR metrics with their versions and evaluation settings.
 
-Do not label a surrogate spectral metric as PESQ, DNSMOS, UTMOS, or ASR accuracy. A metric absent from the evaluator needs a separate implementation and validation before it appears in a result.
+Do not label a surrogate spectral metric as PESQ, DNSMOS, UTMOS, or ASR accuracy. Optional metric adapters need their documented local assets and independent validation before reported scores are treated as evidence; see [metrics.md](metrics.md). UTMOS22 strong is the paper-profile checkpoint monitor, not UTMOSv2 or a full ensemble.
 
 ## 4. Evaluate adversarial fine-tuning
 
@@ -50,17 +50,17 @@ This stage is not the offline paper's frozen-regressor-plus-separate-generator p
 
 ## 5. Evaluate the flexible model
 
-Compare its exits at 4, 8, and 12 against the independently trained fixed baselines. Record exit-sampling probabilities, the shared-decoder duration, the decoder split step, and the pre-decoder learning-rate scale. Save checkpoints before and after the split.
+Compare its exits at 4, 8, and 12 against the independently trained fixed baselines at matched rates and lookahead. `paper_flexible12` spans seven rates and three branches; compare all nine exit/lookahead settings, not only the largest exit. Record exit/lookahead sampling probabilities, the shared-decoder duration, the decoder split step, and the pre-decoder learning-rate scale. Save checkpoints before and after the split. The paper profile leaves the split unset until convergence is reviewed, selects UTMOS22 strong, evaluates full utterances, and removes the validation batch cap.
 
 The regression/adversarial transition and the shared/per-exit transition need separate labels in run metadata. Test their ordering explicitly rather than claiming the complete author schedule is known.
 
 ## 6. Establish streaming feasibility
 
-Benchmark batch size one with the full streaming audio path on the intended deployment machine. Use warm-up, device synchronization for CUDA measurements, and sufficient iterations to report p50, p95, and p99 processing time. Include hardware, operating system, dependency versions, precision, scan backend, sample rate, exit, warm-up, and measurement counts with each result.
+Benchmark batch size one with the full streaming audio path on the intended deployment machine. Use warm-up, device synchronization for CUDA measurements, and sufficient iterations to report p50, p95, and p99 processing time. Include hardware, operating system, dependency versions, precision, mixer implementation, sample rate, exit, lookahead, warm-up, and measurement counts with each result.
 
 The initial hop deadline is **20 ms**. Sustained processing must remain below that budget, including overhead outside the neural network. A useful initial engineering target is p99 below 10 ms to leave room for integration overhead; this is our proposed margin, not an author result or a production guarantee. Also measure sustained overruns and long-run buffer behavior, because a percentile alone cannot rule out accumulated delay.
 
-Report algorithmic latency, processing latency, and device/transport buffering separately. The current 40 ms window is not a promise of 40 ms microphone-to-speaker latency. CPU, laptop, phone, and server-GPU results cannot be substituted for one another.
+Report algorithmic latency, processing latency, and device/transport buffering separately. Algorithmic latency is 40/60/80 ms for lookahead 0/1/2; those are not microphone-to-speaker latency guarantees. Verify first-output timing, exact tail length after flush, stream resets and long-lived bounded state at every intended rate/branch. CPU, laptop, phone, and server-GPU results cannot be substituted for one another.
 
 ## 7. Scale only after measuring throughput
 
@@ -77,6 +77,6 @@ State the assumptions and a range. Neither model parameter count nor published i
 
 ## Later experiments
 
-Add multi-rate support and the full degradation generator only after the fixed-rate baselines pass the gates above. Nonzero look-ahead, shorter windows, optimized scan kernels, quantization, and mobile deployment each require fresh quality and latency checks. Optional distillation must have a separate baseline, licensed teacher/output provenance, and measured preprocessing cost.
+Native multi-rate and nonzero-lookahead paths are implemented and tested structurally, but their learned quality has not been established. Completing the full degradation generator, shortening windows, optimizing kernels, quantization and mobile deployment require separate quality and latency experiments. A 40 ms window cannot meet an under-20-ms end-to-end requirement regardless of GPU speed. Optional distillation must have a separate baseline, licensed teacher/output provenance, and measured preprocessing cost.
 
 No acceptance gate here authorizes cloud resource rental, paid training jobs, dataset acquisition, or publication of weights.

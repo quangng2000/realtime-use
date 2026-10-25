@@ -8,6 +8,8 @@ weight_decay: 0.01
 grad_accum: 1
 clip_grad_norm: 5.0
 sample_exit: false
+sample_lookahead: false
+lookahead: 0
 split_decoders_at: null
 predecoder_lr_scale: 0.1
 workers: 0

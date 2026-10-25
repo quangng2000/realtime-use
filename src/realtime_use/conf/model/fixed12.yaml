@@ -12,3 +12,6 @@ decoder_mode: shared
 scan_backend: auto
 mixer_impl: mamba_ssm
 codec_impl: nemotron_causal
+window_type: hann
+sample_rates: []
+lookahead_frames: [0]

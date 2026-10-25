@@ -79,6 +79,7 @@ def trainer(tmp_path, updates, stage="regression"):
                    max_steps=updates * (2 if stage == "adversarial" else 1), accumulate_grad_batches=1)
 
 
+@pytest.mark.training_loop
 def test_regression_kd_accumulation_transition_and_portable_checkpoint(tmp_path):
     config = tiny_config()
     config["loss"]["kd"] = 0.5
@@ -109,6 +110,7 @@ def test_regression_kd_accumulation_transition_and_portable_checkpoint(tmp_path)
             torch.testing.assert_close(restored.enhance(waveform)[depth], output)
 
 
+@pytest.mark.training_loop
 def test_native_resume_after_split_keeps_optimizer_groups_and_update_count(tmp_path):
     config = tiny_config(split_decoders_at=0, steps=1, grad_accum=1)
     first = EnhancementModule(config)
@@ -128,6 +130,7 @@ def test_native_resume_after_split_keeps_optimizer_groups_and_update_count(tmp_p
     assert continued.optimizers[0].param_groups[0]["lr"] == pytest.approx(1e-4)
 
 
+@pytest.mark.training_loop
 def test_optimizer_honors_parameter_no_weight_decay_flags():
     module = EnhancementModule(tiny_config(weight_decay=0.2))
     named = dict(module.model.named_parameters())
@@ -168,6 +171,7 @@ def test_decoder_transition_reduces_lr_for_decay_and_no_decay_backbone_groups():
         assert group["lr"] == pytest.approx(expected)
 
 
+@pytest.mark.training_loop
 def test_teacher_free_gan_counts_generator_updates_and_resumes(tmp_path):
     config = tiny_config(stage="adversarial", steps=1, split_decoders_at=None)
     config["loss"]["kd"] = 2.0  # Stage two must ignore even invalid supplied teacher tensors.
@@ -212,6 +216,7 @@ def test_portable_initialization_copies_only_model_state_and_resets_updates():
 
 
 @pytest.mark.parametrize("stage", ["regression", "adversarial"])
+@pytest.mark.training_loop
 def test_explicit_library_loss_trains_and_survives_native_resume(tmp_path, stage):
     config = tiny_config(stage=stage, steps=1, split_decoders_at=None)
     config["loss"]["implementation"] = "auraloss"
@@ -243,6 +248,7 @@ def test_partial_update_checkpoint_and_stage_resume_are_rejected():
         module.on_load_checkpoint({"stage": "adversarial"})
 
 
+@pytest.mark.training_loop
 def test_kd_requires_target_and_nonfinite_audio_fails(tmp_path):
     config = tiny_config(steps=1)
     config["loss"]["kd"] = 1.0

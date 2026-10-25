@@ -22,19 +22,27 @@ dependencies = [
 
 [project.scripts]
 realtime-use-train = "realtime_use.train:main"
+realtime-use-preflight = "realtime_use.preflight:main"
+realtime-use-prepare-data = "realtime_use.prepare_data:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 augmentation = ["audiomentations==0.43.1"]
 gan = ["descript-audio-codec==1.0.0", "descript-audiotools==0.7.2"]
 cuda = ["mamba-ssm==2.2.6.post3", "causal-conv1d==1.6.0", "transformers==4.57.6"]
+metrics = ["pystoi==0.4.1", "soxr==0.5.0.post1", "onnxruntime==1.22.1", "torchaudio>=2.5,<3", "librosa>=0.11,<1", "pandas>=2.2,<4", "requests>=2.31,<3", "tqdm>=4.66,<5"]
+metrics-content = ["transformers==4.57.6", "jiwer==4.0.0", "phonemizer==3.3.0", "espnet==202509", "openai-whisper==20250625", "soxr==0.5.0.post1"]
+preparation = ["espnet==202509", "torchaudio==2.7.1", "resampy==0.4.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-realtime_use = ["conf/*.yaml", "conf/*/*.yaml", "_vendor/nemotron_codec/*"]
+realtime_use = ["conf/*.yaml", "conf/*/*.yaml", "_vendor/nemotron_codec/*", "_vendor/espnet_detection/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+  "training_loop: executes Trainer.fit, optimizer updates, or a subprocess training worker; skipped by --no-training",
+]

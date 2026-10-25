@@ -62,7 +62,8 @@ class DACMultiResolutionDiscriminator(nn.Module):
     """
 
     def __init__(self, sample_rate: int, fft_sizes: Sequence[int] = (512, 1024, 2048),
-                 band_width_hz: int = 4000) -> None:
+                 band_width_hz: int = 4000, sample_rates: Sequence[int] = (),
+                 sample_rate_scaling: bool = False) -> None:
         super().__init__()
         if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate < 1:
             raise ValueError("Discriminator sample_rate must be a positive integer")
@@ -74,38 +75,78 @@ class DACMultiResolutionDiscriminator(nn.Module):
             raise ValueError("Discriminator fft_sizes must contain integers >= 8")
         self.sample_rate = sample_rate
         self.band_width_hz = band_width_hz
+        self.sample_rates = tuple(sample_rates) or (sample_rate,)
+        if (sample_rate not in self.sample_rates or len(set(self.sample_rates)) != len(self.sample_rates)
+                or any(isinstance(rate, bool) or not isinstance(rate, int) or rate < 1
+                       for rate in self.sample_rates)):
+            raise ValueError("sample_rates must be unique positive integers including sample_rate")
+        if not isinstance(sample_rate_scaling, bool):
+            raise ValueError("sample_rate_scaling must be boolean")
+        self.sample_rate_scaling = sample_rate_scaling
         # Ratios are relative to Nyquist; the last band may be narrower.
-        boundaries = [*range(0, sample_rate, 2 * band_width_hz), sample_rate]
-        self.bands = [(left / sample_rate, right / sample_rate)
+        maximum_rate = max(self.sample_rates)
+        boundaries = [*range(0, maximum_rate, 2 * band_width_hz), maximum_rate]
+        self.bands = [(left / maximum_rate, right / maximum_rate)
                       for left, right in zip(boundaries[:-1], boundaries[1:])]
-        for size in self.fft_sizes:
-            bins = size // 2 + 1
-            if any(int(right * bins) <= int(left * bins) for left, right in self.bands):
-                raise ValueError("Discriminator FFT resolution leaves an empty frequency band")
+        self._rate_geometry = {}
+        for rate in self.sample_rates:
+            boundaries = [*range(0, rate, 2 * band_width_hz), rate]
+            fractions = [(left / rate, right / rate) for left, right in zip(boundaries[:-1], boundaries[1:])]
+            sizes = self.fft_sizes_for_rate(rate)
+            geometry = []
+            for size in sizes:
+                bins = size // 2 + 1
+                bands = [(int(left * bins), int(right * bins)) for left, right in fractions]
+                if size < 8 or any(right <= left for left, right in bands):
+                    raise ValueError("Discriminator FFT resolution leaves an empty frequency band")
+                geometry.append((size, bands))
+            self._rate_geometry[rate] = geometry
         try:
             from dac.model.discriminator import MRD
         except (ImportError, OSError) as error:
             raise RuntimeError("DAC discriminator requires the gan extra and compatible torch/torchaudio; "
                                "install realtime-use[gan]") from error
         self.discriminators = nn.ModuleList([
-            MRD(window_length=size, sample_rate=sample_rate, bands=self.bands)
-            for size in self.fft_sizes
+            MRD(window_length=size, sample_rate=maximum_rate, bands=self.bands)
+            for size in self.fft_sizes_for_rate(maximum_rate)
         ])
 
-    def forward(self, waveform: Tensor) -> list[list[Tensor]]:
+    def fft_sizes_for_rate(self, sample_rate: int) -> tuple[int, ...]:
+        if sample_rate not in self.sample_rates:
+            raise ValueError(f"Unsupported discriminator sample rate: {sample_rate}")
+        return tuple(round(size * sample_rate / self.sample_rate) if self.sample_rate_scaling else size
+                     for size in self.fft_sizes)
+
+    def forward(self, waveform: Tensor, sample_rate: int | None = None) -> list[list[Tensor]]:
         if waveform.ndim != 2 or min(waveform.shape) < 1 or not waveform.is_floating_point():
             raise ValueError("Discriminator requires nonempty floating-point [batch, samples] audio")
+        rate = self.sample_rate if sample_rate is None else sample_rate
+        if isinstance(rate, bool) or rate not in self._rate_geometry:
+            raise ValueError(f"Unsupported discriminator sample rate: {rate}")
         outputs = []
-        for size, discriminator in zip(self.fft_sizes, self.discriminators):
+        for (size, bands), discriminator in zip(self._rate_geometry[rate], self.discriminators):
             # AudioSignal's match_stride STFT adds reflection padding on both
             # sides, plus right alignment. A full window makes those pads legal
             # even for a one-sample crop; ordinary inputs are passed unchanged.
             padded = F.pad(waveform, (0, max(0, size - waveform.shape[-1])))
-            outputs.append(discriminator(padded.unsqueeze(1)))
+            # All band CNNs are registered before DDP. Lower-rate batches use
+            # the available low-frequency bands; the official forward's zip
+            # leaves higher-band parameters unused. No weights are recreated.
+            original = (discriminator.sample_rate, discriminator.window_length,
+                        discriminator.stft_params, discriminator.bands)
+            discriminator.sample_rate, discriminator.window_length = rate, size
+            discriminator.stft_params = original[2]._replace(window_length=size, hop_length=size // 4)
+            discriminator.bands = bands
+            try:
+                outputs.append(discriminator(padded.unsqueeze(1)))
+            finally:
+                (discriminator.sample_rate, discriminator.window_length,
+                 discriminator.stft_params, discriminator.bands) = original
         return outputs
 
 
-def build_discriminator(settings: Mapping[str, Any], sample_rate: int) -> nn.Module:
+def build_discriminator(settings: Mapping[str, Any], sample_rate: int,
+                        sample_rates: Sequence[int] = ()) -> nn.Module:
     """Missing implementation preserves the architecture of older checkpoints."""
     implementation = settings.get("implementation", "legacy")
     if implementation == "legacy":
@@ -113,5 +154,6 @@ def build_discriminator(settings: Mapping[str, Any], sample_rate: int) -> nn.Mod
     if implementation == "dac_mrd":
         return DACMultiResolutionDiscriminator(sample_rate=sample_rate,
             fft_sizes=settings.get("fft_sizes", (512, 1024, 2048)),
-            band_width_hz=settings.get("band_width_hz", 4000))
+            band_width_hz=settings.get("band_width_hz", 4000), sample_rates=sample_rates,
+            sample_rate_scaling=settings.get("sample_rate_scaling", False))
     raise ValueError("adversarial.implementation must be legacy or dac_mrd")

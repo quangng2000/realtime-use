@@ -33,6 +33,7 @@ def tiny_config(output_dir):
 
 
 @pytest.mark.parametrize("stage", ["regression", "adversarial"])
+@pytest.mark.training_loop
 def test_final_validation_checkpoint_retains_native_resume_state(tmp_path, stage):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -71,6 +72,7 @@ def test_final_validation_checkpoint_retains_native_resume_state(tmp_path, stage
         torch.set_num_threads(previous_threads)
 
 
+@pytest.mark.training_loop
 def test_final_validation_stays_inside_fit_and_preserves_rng(tmp_path, monkeypatch):
     before = {}
     original = RunArtifacts.on_train_end
@@ -94,6 +96,7 @@ def test_final_validation_stays_inside_fit_and_preserves_rng(tmp_path, monkeypat
         torch.set_num_threads(previous_threads)
 
 
+@pytest.mark.training_loop
 def test_pre_library_native_checkpoint_resumes_only_with_legacy_objective(tmp_path):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -132,6 +135,7 @@ def test_checkpoint_policy_uses_lightning_model_checkpoint(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["regression", "adversarial"])
+@pytest.mark.training_loop
 def test_periodic_names_count_generator_updates_and_resume_between_boundaries(tmp_path, stage):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -158,6 +162,7 @@ def test_periodic_names_count_generator_updates_and_resume_between_boundaries(tm
 
 
 @pytest.mark.parametrize("destination", ["same", "different", "missing_best"])
+@pytest.mark.training_loop
 def test_legacy_best_score_migrates_only_with_original_best_file(tmp_path, destination):
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)

@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import soundfile as sf
 
 from .audio import StreamingEnhancer
 from .data import read_mono_audio
@@ -47,6 +48,8 @@ def benchmark_stream(
     waveform: torch.Tensor,
     exit_depth: int | None = None,
     warmup_seconds: float = 1.0,
+    sample_rate: int | None = None,
+    lookahead: int = 0,
 ) -> dict[str, Any]:
     """Single stream, batch one; host input/output transfers are inside timing.
 
@@ -59,17 +62,18 @@ def benchmark_stream(
         raise ValueError("warmup_seconds must be nonnegative")
     device = next(model.parameters()).device
     config = model.config
+    rate = config.sample_rate if sample_rate is None else sample_rate
     exit_depth = max(config.exits) if exit_depth is None else exit_depth
     if exit_depth not in config.exits:
         raise ValueError(f"exit_depth must be one of {config.exits}")
-    hop_samples = round(config.sample_rate * config.hop_ms / 1000)
-    startup_hops = math.ceil(config.window_ms / config.hop_ms)
+    stream = StreamingEnhancer(model, exit_depth, sample_rate=rate, lookahead=lookahead)
+    hop_samples = stream.transform.hop_samples
+    startup_hops = math.ceil(config.window_ms / config.hop_ms) + lookahead
     total_hops = waveform.numel() // hop_samples
     if total_hops <= startup_hops:
         raise ValueError(f"benchmark needs more than {startup_hops} complete hops")
     host_input = waveform[: total_hops * hop_samples].detach().to("cpu").unsqueeze(0)
-    stream = StreamingEnhancer(model, exit_depth)
-    warmup_hops = math.ceil(warmup_seconds * config.sample_rate / hop_samples)
+    warmup_hops = math.ceil(warmup_seconds * rate / hop_samples)
     for index in range(warmup_hops):
         offset = (index % total_hops) * hop_samples
         stream.push(host_input[:, offset : offset + hop_samples].to(device)).cpu()
@@ -108,16 +112,17 @@ def benchmark_stream(
         "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else platform.processor() or platform.machine(),
         "torch_version": str(torch.__version__),
         "cpu_threads": torch.get_num_threads(),
-        "sample_rate": config.sample_rate,
+        "sample_rate": rate,
         "exit_depth": exit_depth,
-        "active_parameters": model.active_parameter_count(exit_depth),
+        "active_parameters": model.active_parameter_count(exit_depth, lookahead),
         "algorithmic_window_ms": config.window_ms,
-        "lookahead_frames": 0,
-        "input_seconds_measured": host_input.shape[-1] / config.sample_rate,
+        "lookahead_frames": lookahead,
+        "algorithmic_latency_ms": config.window_ms + lookahead * config.hop_ms,
+        "input_seconds_measured": host_input.shape[-1] / rate,
         "input_tail_samples_excluded": waveform.numel() - host_input.shape[-1],
         "warmup_hops": warmup_hops,
         "startup_hops_excluded_from_steady_state": startup_hops,
-        "input_ms_before_first_output": first_output_input_samples * 1000 / config.sample_rate if first_output_input_samples else None,
+        "input_ms_before_first_output": first_output_input_samples * 1000 / rate if first_output_input_samples else None,
         "all_hop_calls": summarize_timings(timings, config.hop_ms),
         "steady_state_hop_calls": summarize_timings(timings[startup_hops:], config.hop_ms),
         "flush_ms": flush_ms,
@@ -135,6 +140,8 @@ def main() -> None:
     parser.add_argument("--warmup-seconds", type=float, default=1.0)
     parser.add_argument("--input", help="Optional mono timing input at the model sample rate")
     parser.add_argument("--threads", type=int)
+    parser.add_argument("--sample-rate", type=int)
+    parser.add_argument("--lookahead", type=int)
     args = parser.parse_args()
     if args.seconds <= 0:
         parser.error("--seconds must be positive")
@@ -143,12 +150,16 @@ def main() -> None:
             parser.error("--threads must be positive")
         torch.set_num_threads(args.threads)
     model = load_model(args.checkpoint, args.device)
-    samples = round(args.seconds * model.config.sample_rate)
+    rate = (args.sample_rate if args.sample_rate is not None else
+            int(sf.info(args.input).samplerate) if args.input else model.config.sample_rate)
+    lookahead = min(model.config.lookahead_frames) if args.lookahead is None else args.lookahead
+    model.transform_for(rate)
+    samples = round(args.seconds * rate)
     waveform = (
-        read_mono_audio(args.input, model.config.sample_rate)[:samples]
+        read_mono_audio(args.input, rate)[:samples]
         if args.input else torch.randn(samples, generator=torch.Generator().manual_seed(31)) * 0.05
     )
-    report = benchmark_stream(model, waveform, args.exit_depth, args.warmup_seconds)
+    report = benchmark_stream(model, waveform, args.exit_depth, args.warmup_seconds, rate, lookahead)
     report["checkpoint"] = str(Path(args.checkpoint).resolve())
     report["input_kind"] = "user_audio" if args.input else "synthetic_noise_for_timing_only"
     destination = Path(args.output)
