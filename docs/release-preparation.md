@@ -75,6 +75,14 @@ uses lossless gzip level 1 for backup containers. Both options are execution
 settings and preserve sampled audio and recipe identity. A backup failure stops preparation,
 cleans up active materialization workers, and prevents publication of `READY.json`.
 
+`--overlap-materialized-backups` independently enables source-stage overlap:
+exactly one extractor process and one closed-group backup worker. It requires
+`--backup-dir` and `--materialize-workers 1`, and allows at most two uncommitted
+groups. A backup failure stops the active extractor promptly. All group receipts
+must finish before source auditing or pair rendering. This runtime option does
+not change the frozen request, source selection, or the local disk budget; enable
+it only after measuring mixed source reads and backup I/O on the destination.
+
 Checkpoints stream immutable tar archives directly to the backup destination,
 flush them durably, verify their full contents by checksum, and publish a synced
 receipt last. They do not

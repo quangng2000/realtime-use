@@ -10,6 +10,7 @@ import argparse
 from contextlib import nullcontext
 import gzip
 import hashlib
+from importlib import metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,24 @@ import uuid
 
 _FORMAT = 1
 _BLOCK = 1024 * 1024
+
+
+def validate_compression(compression: str):
+    """Resolve an explicit writer before creating or changing preparation output."""
+    if compression == 'none':
+        return None
+    if compression == 'gzip':
+        return gzip.GzipFile
+    if compression != 'gzip-isal':
+        raise ValueError('Backup compression must be none or gzip or gzip-isal')
+    message = 'gzip-isal requires isal==1.8.0; install the backup-acceleration extra'
+    try:
+        if metadata.version('isal') != '1.8.0':
+            raise RuntimeError(message)
+        from isal.igzip import IGzipFile
+    except (metadata.PackageNotFoundError, ImportError, OSError) as exc:
+        raise RuntimeError(message) from exc
+    return IGzipFile
 
 
 def _digest(path: Path) -> str:
@@ -140,8 +159,7 @@ class _HashingWriter:
 class PreparationBackup:
     """Back up completed units; concurrency settings never change recipe identity."""
     def __init__(self, output_root: Path, backup_dir: Path, *, compression: str = 'none'):
-        if compression not in ('none', 'gzip'):
-            raise ValueError('Backup compression must be none or gzip')
+        self._gzip_file = validate_compression(compression)
         self.compression = compression
         self._receipt_lock = threading.Lock()
         self._active_units = set()
@@ -228,7 +246,7 @@ class PreparationBackup:
         if unit == 'final' and ('READY.json' not in members or not dependencies):
             raise ValueError('Final checkpoint requires READY.json and preceding unit receipts')
         token = uuid.uuid4().hex
-        archive_relative = f'objects/{token}.tar' + ('.gz' if self.compression == 'gzip' else '')
+        archive_relative = f'objects/{token}.tar' + ('.gz' if self._gzip_file is not None else '')
         archive_path = self.backup_dir / archive_relative
         # A unique object needs no remote rename or lock. Flush it through the
         # filesystem before readback: a FUSE cache hit alone proves no durability.
@@ -236,9 +254,9 @@ class PreparationBackup:
             writer = _HashingWriter(destination)
             # Hash the stored bytes, including the gzip footer. Compression is
             # transport policy only: existing semantic receipts remain reusable.
-            compressor = (gzip.GzipFile(filename='', mode='wb', fileobj=writer,
-                                       compresslevel=1, mtime=0)
-                          if self.compression == 'gzip' else nullcontext(writer))
+            compressor = (self._gzip_file(filename='', mode='wb', fileobj=writer,
+                                         compresslevel=2 if self.compression == 'gzip-isal' else 1, mtime=0)
+                          if self._gzip_file is not None else nullcontext(writer))
             with compressor as stream:
                 with tarfile.open(fileobj=stream, mode='w|', format=tarfile.PAX_FORMAT, bufsize=_BLOCK) as archive:
                     for name, path in sorted(members.items()):

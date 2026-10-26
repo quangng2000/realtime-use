@@ -279,8 +279,79 @@ def _abort_materializers(executor: ProcessPoolExecutor, pending) -> None:
     executor.shutdown(wait=True, cancel_futures=True)
 
 
-def _materialize_groups(plan, partitions, workers: int, *, backup=None):
+def _materialize_groups_overlapped(plan, partitions, backup):
+    """One extractor plus one closed-group backup; at most two uncommitted groups."""
+    output = Path(plan['output_dir'])
+    iterator, completed = iter(partitions.items()), {}
+    extracting = backing = waiting = None
+    exhausted = False
+    with _single_threaded_children(), prep._graceful_sigterm(), ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix='materialized-backup'
+    ) as backup_pool:
+        extractor = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context('spawn'),
+                                        initializer=_materialization_worker_init)
+        try:
+            while True:
+                if backing is None and waiting is not None:
+                    key, result = waiting
+                    directory = output / 'materialized' / key
+                    future = backup_pool.submit(backup.checkpoint, f'materialized/{key}', [directory],
+                                                [directory / 'request.json', directory / 'records.jsonl'])
+                    backing, waiting = (key, result, future), None
+                if extracting is None and waiting is None and not exhausted:
+                    following = next(iterator, None)
+                    if following is None:
+                        exhausted = True
+                    else:
+                        key, path = following
+                        group = plan['groups'][key]
+                        future = extractor.submit(_materialize_group, plan['root'], str(path),
+                            str(output / 'materialized' / key), group['role'], group.get('wind_id_scope', 'global'))
+                        extracting = key, future
+                pending = ([extracting[1]] if extracting is not None else []) + (
+                    [backing[2]] if backing is not None else [])
+                if not pending:
+                    break
+                _progress(output, stage='materializing', completed_groups=len(completed),
+                          total_groups=len(partitions), materialize_workers=1,
+                          extracting_group=extracting[0] if extracting else None,
+                          backing_up_group=backing[0] if backing else None,
+                          waiting_for_backup_group=waiting[0] if waiting else None,
+                          materialized_backup_workers=1)
+                finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # Observe every finished result before scheduling another group.
+                results = {future: future.result() for future in finished}
+                if backing is not None and backing[2] in results:
+                    completed[backing[0]] = backing[1]
+                    backing = None
+                if extracting is not None and extracting[1] in results:
+                    waiting = extracting[0], results[extracting[1]]
+                    extracting = None
+        except BaseException as error:
+            try:
+                _abort_materializers(extractor, [extracting[1]] if extracting else [])
+            finally:
+                # Closed-group backup may finish durably during cancellation.
+                # Join and observe it before relinquishing this run's ownership.
+                if backing is not None:
+                    try:
+                        backing[2].result()
+                    except BaseException as backup_error:
+                        if backup_error is not error and hasattr(error, 'add_note'):
+                            error.add_note(f'Materialized backup also failed: {backup_error!r}')
+            raise
+        else:
+            extractor.shutdown(wait=True, cancel_futures=True)
+    return {key: completed[key] for key in partitions}
+
+
+def _materialize_groups(plan, partitions, workers: int, *, backup=None,
+                        overlap_materialized_backups: bool = False):
     """Bound in-flight jobs to workers and retain deterministic corpus order."""
+    if overlap_materialized_backups:
+        if backup is None or workers != 1:
+            raise ValueError('Materialized backup overlap requires backup and materialize_workers=1')
+        return _materialize_groups_overlapped(plan, partitions, backup)
     output = Path(plan['output_dir'])
     completed = {}
 
@@ -475,9 +546,9 @@ def _combine(manifests: list[Path], destination: Path, split: str) -> int:
 class _ChunkBackups:
     """Bounded closed chunks in backup while the next chunk renders locally.
 
-    Source materialization stays synchronous: its remote archive reads must not
-    compete with checkpoint I/O. All backup workers join before final publication,
-    so the final receipt includes every preceding checkpoint dependency.
+    Source materialization has a separate bounded checkpoint policy and finishes
+    before this phase. All backup workers join before final publication, so the
+    final receipt includes every preceding checkpoint dependency.
     """
     def __init__(self, backup, overlap: bool, workers: int = 1):
         self.backup, self.overlap = backup, overlap
@@ -543,21 +614,29 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
                     backup_dir: Path | None = None,
                     overlap_backups: bool = False,
                     backup_compression: str = 'none',
-                    backup_workers: int = 1) -> dict[str, Any]:
+                    backup_workers: int = 1,
+                    overlap_materialized_backups: bool = False) -> dict[str, Any]:
     workers = _worker_count(workers, 'workers')
     materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
     if not isinstance(overlap_backups, bool):
         raise ValueError('overlap_backups must be a boolean')
     if overlap_backups and backup_dir is None:
         raise ValueError('Overlapping backups requires a backup directory')
+    if not isinstance(overlap_materialized_backups, bool):
+        raise ValueError('overlap_materialized_backups must be a boolean')
+    if overlap_materialized_backups and (backup_dir is None or materialize_workers != 1):
+        raise ValueError('Materialized backup overlap requires a backup directory and materialize_workers=1')
     if isinstance(backup_workers, bool) or not isinstance(backup_workers, int) or backup_workers not in (1, 2):
         raise ValueError('backup_workers must be 1 or 2')
     if backup_workers != 1 and not overlap_backups:
         raise ValueError('Two backup workers requires overlap_backups')
-    if backup_compression not in ('none', 'gzip'):
-        raise ValueError('Backup compression must be none or gzip')
+    if backup_compression not in ('none', 'gzip', 'gzip-isal'):
+        raise ValueError('Backup compression must be none or gzip or gzip-isal')
     if backup_compression != 'none' and backup_dir is None:
         raise ValueError('Backup compression requires a backup directory')
+    if backup_dir is not None:
+        from .preparation_backup import validate_compression
+        validate_compression(backup_compression)  # Fail before request/READY mutation.
     output = Path(plan['output_dir'])
     if backup_dir is not None:
         backup_dir = Path(backup_dir).expanduser().resolve()
@@ -582,6 +661,7 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     _write(output / 'execution.json', _json({'render_workers': workers,
         'materialize_workers': materialize_workers, 'process_start_method': 'spawn',
         **({'backup_dir': str(backup_dir), 'overlap_backups': overlap_backups,
+            'overlap_materialized_backups': overlap_materialized_backups,
             'backup_compression': backup_compression, 'backup_workers': backup_workers}
            if backup_dir is not None else {}),
         'training_started': False}), immutable=False)
@@ -590,7 +670,8 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     if backup is not None:
         backup.checkpoint('root', [output / 'request.json', output / 'indices'],
                           [output / 'request.json', *partitions.values()])
-    materialized = _materialize_groups(plan, partitions, materialize_workers, backup=backup)
+    materialized = _materialize_groups(plan, partitions, materialize_workers, backup=backup,
+                                       overlap_materialized_backups=overlap_materialized_backups)
     _progress(output, stage='auditing_materialized_sources')
     source_audit = audit_materialized_sources(plan, materialized)
     _write(output / 'source-split-audit.json', _json(source_audit))
@@ -690,10 +771,12 @@ def main() -> None:
                         help='Persistent checkpoints outside the local output; runtime setting, not a recipe change')
     parser.add_argument('--overlap-backups', action='store_true',
                         help='Back up closed chunks while the next renders locally; requires --backup-dir')
+    parser.add_argument('--overlap-materialized-backups', action='store_true',
+                        help='Overlap one closed source-group backup with one extractor; requires --backup-dir and --materialize-workers 1')
     parser.add_argument('--backup-workers', type=int, choices=(1, 2), default=1,
                         help='Concurrent checkpoints; 2 requires --overlap-backups')
-    parser.add_argument('--backup-compression', choices=('none', 'gzip'), default='none',
-                        help='Lossless checkpoint compression; gzip uses level1 and requires --backup-dir')
+    parser.add_argument('--backup-compression', choices=('none', 'gzip', 'gzip-isal'), default='none',
+                        help='Lossless checkpoints: stdlib gzip level1 or ISA-L level2; gzip-isal requires the backup-acceleration extra')
     parser.add_argument('--usage', choices=('research',), default='research',
                         help='This release route retains pending permission evidence; commercial preparation uses the audited adapter separately')
     parser.add_argument('--rir-alignment', choices=('upstream-estimated-onset',), default='upstream-estimated-onset')
@@ -707,6 +790,7 @@ def main() -> None:
                         max_speech_per_split=args.max_speech_per_split, validation_reuse_rir=args.validation_reuse_rir)
     print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers,
                                backup_dir=args.backup_dir, overlap_backups=args.overlap_backups,
+                               overlap_materialized_backups=args.overlap_materialized_backups,
                                backup_compression=args.backup_compression, backup_workers=args.backup_workers)
                 if args.execute else plan))
 

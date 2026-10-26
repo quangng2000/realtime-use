@@ -41,9 +41,20 @@ final receipt and does not restore its stale readiness marker.
 
 `--overlap-backups` allows closed chunk checkpoints to run while the next chunk
 renders on local disk. `--backup-workers 1` (default) or `2` limits concurrent checkpoints; the queue
-is bounded and final readiness waits for every result. Materialization checkpoints remain synchronous; use `--materialize-workers 1`
+is bounded and final readiness waits for every result. Materialization checkpoints remain synchronous by default; use `--materialize-workers 1`
 to avoid competing remote source reads. Interrupted work can require repeating an uncommitted chunk;
 completed receipts remain valid.
+
+`--overlap-materialized-backups` enables a separate, bounded source-stage
+pipeline: one extractor process overlaps one completed group's backup. It
+requires `--backup-dir` and `--materialize-workers 1`; the chunk-stage
+`--backup-workers` setting does not increase source-stage concurrency. At most
+two source groups are uncommitted. Either operation failing prevents further
+groups from starting, stops the extractor, and joins any active backup. All
+group receipts are committed before source auditing and pair rendering begin.
+Groups use disjoint output directories, and backup streams directly to persistent
+storage, so no extra local archive is required. The frozen recipe is unchanged.
+Benchmark mixed reads and writes before enabling this option on a FUSE mount.
 
 `--backup-compression gzip` uses standard-library lossless gzip level 1 to reduce
 transfer and storage size. It changes the checkpoint container only; audio bytes
@@ -51,6 +62,19 @@ restore exactly. Default `none` writes uncompressed tar. Both formats may coexis
 in one backup, and changing compression does not change the frozen recipe or
 force already verified checkpoints to be rewritten. Benchmark throughput on the
 actual destination before choosing these runtime options.
+
+`--backup-compression gzip-isal` explicitly selects level 2 compression from
+[`python-isal`](https://github.com/pycompression/python-isal/tree/v1.8.0), using
+the same standard `.tar.gz` format. Install the pinned optional dependency with
+`python -m pip install '.[backup-acceleration]'` in the preparation environment.
+Missing, incompatible, or unloadable `isal==1.8.0` fails before the release driver
+changes output or readiness; there is no automatic fallback. ISA-L and standard
+gzip levels have different speed/size tradeoffs, so measure total archive write,
+durable flush, and readback time on the actual destination. Each backup worker
+uses one compression stream. The selected implementation is recorded in
+`execution.json`, remains outside recipe identity, and never changes audio bytes.
+Ordinary gzip, ISA-L gzip, and uncompressed checkpoints may be mixed or reused;
+restore needs only the Python standard library, without ISA-L installed.
 
 ## Restore
 
@@ -101,5 +125,7 @@ backup remains available. An unexpected machine loss can require repeating the
 active, not-yet-committed chunks or source materialization group. Without
 overlap, at most one chunk is active. With overlap, up to `backup-workers` closed
 chunks and one currently rendering chunk may need to be repeated; each has up to
-the configured 1,024 utterances. A planned shutdown should wait until a checkpoint boundary
+the configured 1,024 utterances. Source-stage overlap can instead leave up to two
+whole source groups uncommitted; their size is not limited by the render chunk
+size. A planned shutdown should wait until a checkpoint boundary
 has completed. The original source archives remain independently preserved.
