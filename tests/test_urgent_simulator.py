@@ -34,12 +34,14 @@ def official(tmp_path, monkeypatch):
     return module
 
 
-def test_vendored_function_block_hash_is_unchanged():
+def test_vendored_function_block_has_only_documented_bool_alias_patch():
     import realtime_use._vendor.espnet_detection as detection
     source = Path(detection.__file__)
     metadata = json.loads(source.with_name('SOURCE.json').read_text())
-    functions = source.read_text().split('def framing(', 1)[1]
-    assert hashlib.sha256(('def framing(' + functions).encode()).hexdigest() == metadata['function_block_sha256']
+    functions = 'def framing(' + source.read_text().split('def framing(', 1)[1]
+    assert hashlib.sha256(functions.encode()).hexdigest() == metadata['vendored_function_block_sha256']
+    original = functions.replace('dtype=bool', 'dtype=np.bool').replace('dtype == bool', 'dtype == np.bool')
+    assert hashlib.sha256(original.encode()).hexdigest() == metadata['function_block_sha256']
 
 
 def test_vendored_functions_match_installed_pinned_upstream(official):
@@ -51,6 +53,20 @@ def test_vendored_functions_match_installed_pinned_upstream(official):
     block = text[text.index('def framing('):text.index('\ndef any_allzero')]
     metadata = json.loads(Path(detection.__file__).with_name('SOURCE.json').read_text())
     assert hashlib.sha256(block.encode()).hexdigest() == metadata['function_block_sha256']
+    vendored = 'def framing(' + Path(detection.__file__).read_text().split('def framing(', 1)[1]
+    assert vendored == block.replace('np.bool', 'bool')
+
+
+@pytest.mark.parametrize('length', [64, 2048])
+@pytest.mark.parametrize('silent_speech,silent_noise', [(False, True), (True, False), (True, True)])
+def test_actual_official_mix_keeps_zero_power_and_short_fallbacks(official, length, silent_speech, silent_noise):
+    speech = np.zeros((1, length)) if silent_speech else np.full((1, length), .1)
+    noise = np.zeros((1, length)) if silent_noise else np.full((1, length), .2)
+    mixed, scaled_noise = official.mix_noise(speech, noise, snr=10, rng=np.random.default_rng(12))
+    assert mixed.shape == scaled_noise.shape == speech.shape
+    assert np.isfinite(mixed).all() and np.isfinite(scaled_noise).all()
+    np.testing.assert_array_equal(scaled_noise, np.zeros_like(noise))
+    np.testing.assert_array_equal(mixed, speech)
 
 
 @pytest.mark.parametrize('augmentation', ['none', 'clipping(min=0.05,max=0.95)',

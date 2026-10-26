@@ -10,5 +10,6 @@
     "detect_non_silence"
   ],
   "function_block_sha256": "75f5ba9f4534f03e64d31769f8df7f0a7536360e4df8cdabb45b45e132c1e52c",
-  "modifications": "Only module imports/header isolated. Function block is byte-identical to ESPnet202509 wheel."
+  "modifications": "Module imports/header isolated. Local NumPy compatibility patch replaces np.bool with built-in bool in two fallback dtype arguments and the doctest; all other function-block bytes and numerical behavior are unchanged. function_block_sha256 identifies the original upstream block; vendored_function_block_sha256 identifies the patched block.",
+  "vendored_function_block_sha256": "4aa33bee9e0a352e5f2cc172301aca6b151306903d42343fe6daf0e503c7391b"
 }

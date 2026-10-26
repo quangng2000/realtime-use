@@ -1,6 +1,8 @@
-"""Unchanged ESPnet 202509 audio utility functions; see SOURCE.json and LICENSE.
+"""ESPnet 202509 audio utilities; see SOURCE.json and LICENSE.
 
 Imports are isolated to avoid importing unrelated NLP tokenizers/model assets.
+Local compatibility patch: use built-in bool instead of the removed np.bool
+alias. The fallback masks and detection algorithm are otherwise unchanged.
 """
 
 import numpy as np
@@ -63,10 +65,10 @@ def detect_non_silence(
     >>> x = np.random.randn(1000)
     >>> detect = detect_non_silence(x)
     >>> assert x.shape == detect.shape
-    >>> assert detect.dtype == np.bool
+    >>> assert detect.dtype == bool
     """
     if x.shape[-1] < frame_length:
-        return np.full(x.shape, fill_value=True, dtype=np.bool)
+        return np.full(x.shape, fill_value=True, dtype=bool)
 
     if x.dtype.kind == "i":
         x = x.astype(np.float64)
@@ -84,7 +86,7 @@ def detect_non_silence(
     # mean_power: (C, 1)
     mean_power = np.mean(power, axis=-1, keepdims=True)
     if np.all(mean_power == 0):
-        return np.full(x.shape, fill_value=True, dtype=np.bool)
+        return np.full(x.shape, fill_value=True, dtype=bool)
     # detect_frames: (C, T)
     detect_frames = power / mean_power > threshold
     # detects: (C, T, F)
