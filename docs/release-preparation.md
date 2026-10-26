@@ -21,7 +21,7 @@ Inspect the plan without writing output:
 python -m realtime_use.prepare_release \
   --root /workspace-global/realtime-use/urgent2025-research-v1 \
   --source /opt/urgent-pristine \
-  --output-dir /workspace-global/realtime-use/paired-research-v1
+  --output-dir /scratch/realtime-use/paired-research-v1
 ```
 
 Add `--execute` to prepare audio. All released speech is selected by default, with
@@ -60,6 +60,40 @@ for active preparation, retaining verified archives on persistent storage.
 See [Runpod's Global Volume limitations](https://docs.runpod.io/storage/globalvolume/overview#limitations).
 Checksummed resume verifies saved records and audio, but cannot make an
 object-backed mount provide unsupported filesystem semantics.
+
+For local preparation with persistent recovery, add
+`--backup-dir /backup/realtime-use/paired-research-v1`. The backup directory must
+be outside the active output tree, on storage that survives loss of the compute
+instance. Its location is recorded in `execution.json`, outside the frozen
+request, so it can change when resuming. The pipeline first checkpoints its
+request and partitioned indices, then each closed materialization group and each
+verified rendered chunk before proceeding. A backup failure stops preparation,
+cleans up active materialization workers, and prevents publication of `READY.json`.
+
+Checkpoints stream immutable tar archives directly to the backup destination,
+verify their full contents by checksum, and publish a receipt last. They do not
+need a second local tar copy. Runtime timings and reused-file counts do not change
+checkpoint identity. The final checkpoint includes manifests, audits,
+`data-paths.yaml`, and the staged readiness marker; local readiness is published
+only after that final backup succeeds. The backup destination may be a network
+volume or another mounted persistent filesystem; storage capacity and mount
+durability must be checked separately.
+
+To recover after local output loss, restore to the **same absolute output path**:
+
+```bash
+python -m realtime_use.preparation_backup restore \
+  --backup-dir /backup/realtime-use/paired-research-v1 \
+  --output-root /scratch/realtime-use/paired-research-v1
+```
+
+Then rerun the original preparation command with `--backup-dir`. A partial backup
+restores completed units without advertising readiness; remaining units resume.
+The source release, original archive shards, and pinned upstream checkout are
+external dependencies and are **not** included in these preparation checkpoints.
+Retain them separately at their recorded paths. Do not reclaim local completed
+groups or chunks while the release driver is running; this option provides
+recovery checkpoints, not a rolling storage cache.
 
 For a deliberately limited readiness check, add `--max-speech-per-split 16` and use
 a separate output directory. The report labels this an `explicit_readiness_subset`;

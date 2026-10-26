@@ -279,7 +279,7 @@ def _abort_materializers(executor: ProcessPoolExecutor, pending) -> None:
     executor.shutdown(wait=True, cancel_futures=True)
 
 
-def _materialize_groups(plan, partitions, workers: int):
+def _materialize_groups(plan, partitions, workers: int, *, backup=None):
     """Bound in-flight jobs to workers and retain deterministic corpus order."""
     output = Path(plan['output_dir'])
     completed = {}
@@ -288,11 +288,18 @@ def _materialize_groups(plan, partitions, workers: int):
         return (plan['root'], str(path), str(output / 'materialized' / key),
                 plan['groups'][key]['role'], plan['groups'][key].get('wind_id_scope', 'global'))
 
+    def completed_group(key, result):
+        if backup is not None:
+            directory = output / 'materialized' / key
+            backup.checkpoint(f'materialized/{key}', [directory],
+                              [directory / 'request.json', directory / 'records.jsonl'])
+        completed[key] = result
+
     if workers == 1:
         for index, (key, path) in enumerate(partitions.items()):
             _progress(output, stage='materializing', group=key, completed_groups=index,
                       total_groups=len(partitions), materialize_workers=1)
-            completed[key] = _materialize_group(*task(key, path))
+            completed_group(key, _materialize_group(*task(key, path)))
         return completed
 
     iterator = iter(partitions.items())
@@ -312,7 +319,7 @@ def _materialize_groups(plan, partitions, workers: int):
                 # no new group is launched merely because a peer completed too.
                 for future in finished:
                     key = pending.pop(future)
-                    completed[key] = future.result()
+                    completed_group(key, future.result())
                 for _ in finished:
                     following = next(iterator, None)
                     if following is not None:
@@ -466,10 +473,15 @@ def _combine(manifests: list[Path], destination: Path, split: str) -> int:
 
 
 def execute_release(plan: dict[str, Any], *, workers: int = 1,
-                    materialize_workers: int = 1) -> dict[str, Any]:
+                    materialize_workers: int = 1,
+                    backup_dir: Path | None = None) -> dict[str, Any]:
     workers = _worker_count(workers, 'workers')
     materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
     output = Path(plan['output_dir'])
+    if backup_dir is not None:
+        backup_dir = Path(backup_dir).expanduser().resolve()
+        if backup_dir == output or backup_dir.is_relative_to(output) or output.is_relative_to(backup_dir):
+            raise ValueError('Backup and preparation directories must not overlap')
     # Revalidate the exact frozen request, including all finalized input hashes.
     current = release_plan(Path(plan['root']), Path(plan['source']), output,
                            chunk_size=plan['chunk_size'], max_speech_per_split=plan['max_speech_per_split'],
@@ -479,15 +491,23 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     if output.exists() and not (output / 'request.json').is_file():
         raise ValueError('Existing output lacks a matching preparation request')
     _write(output / 'request.json', _json(plan))
+    backup = None
+    if backup_dir is not None:
+        from .preparation_backup import PreparationBackup
+        backup = PreparationBackup(output, backup_dir)
     _invalidate_ready(output)
     # Concurrency is operational state, not part of the frozen data recipe.
     # Recording it separately lets a resumed job change its CPU allocation.
     _write(output / 'execution.json', _json({'render_workers': workers,
         'materialize_workers': materialize_workers, 'process_start_method': 'spawn',
+        **({'backup_dir': str(backup_dir)} if backup_dir is not None else {}),
         'training_started': False}), immutable=False)
     _progress(output, stage='partitioning', selection=plan['selection_scope'], selected_counts=plan['selected_counts'])
     partitions = _partition(plan)
-    materialized = _materialize_groups(plan, partitions, materialize_workers)
+    if backup is not None:
+        backup.checkpoint('root', [output / 'request.json', output / 'indices'],
+                          [output / 'request.json', *partitions.values()])
+    materialized = _materialize_groups(plan, partitions, materialize_workers, backup=backup)
     _progress(output, stage='auditing_materialized_sources')
     source_audit = audit_materialized_sources(plan, materialized)
     _write(output / 'source-split-audit.json', _json(source_audit))
@@ -511,6 +531,20 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
                     used_rirs.add(row['rir_uid'])
             if observed != set(selected):
                 raise ValueError('Rendered chunk did not cover exactly the selected speech')
+            if backup is not None:
+                directory = Path(chunk['output_dir'])
+                inputs = output / 'chunk-inputs' / split / f'{index:06d}'
+                settings = output / 'settings' / split
+                # These files define the samples and their resume identity.
+                # provenance.json includes changing timings/reuse counts and is
+                # archived for diagnosis, but must not force a new checkpoint.
+                identity = [directory / name for name in (
+                    'plan.json', 'simulation.yaml', 'render-runtime.json',
+                    'render-progress.jsonl', 'manifest.jsonl', 'log/meta.tsv')]
+                identity.extend(path for parent in (inputs, settings)
+                                for path in sorted(parent.rglob('*')) if path.is_file())
+                backup.checkpoint(f'chunks/{split}/{index:06d}',
+                                  [directory, inputs, settings], identity)
             manifests.append(manifest)
         rendered[split] = manifests
     # Neither final split manifest is published until every chunk of both
@@ -539,7 +573,18 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
               'request_sha256': prep.sha256(output / 'request.json'), 'rir_alignment': plan['rir_alignment'],
               'manifests': {split: {'path': str(path), 'sha256': prep.sha256(path)} for split, path in combined.items()},
               'hydra_data_paths': str(output / 'data-paths.yaml')}
-    _write(output / 'READY.json', _json(result))
+    if backup is None:
+        _write(output / 'READY.json', _json(result))
+    else:
+        # The backup stores this staged marker as READY.json. Publish the local
+        # marker only after every required unit and the final receipt commit.
+        ready = output / 'READY.pending.json'
+        _write(ready, _json(result))
+        final_paths = [output / 'manifests', output / 'source-split-audit.json',
+                       output / 'split-audit.json', output / 'data-paths.yaml', ready]
+        final_identity = [*combined.values(), *final_paths[1:]]
+        backup.checkpoint('final', final_paths, final_identity)
+        os.replace(ready, output / 'READY.json')
     _progress(output, stage='ready', examples=counts, training_started=False)
     return result
 
@@ -554,6 +599,8 @@ def main() -> None:
                         help='Parallel official renderer processes per chunk; runtime setting, not a recipe change')
     parser.add_argument('--materialize-workers', type=int, default=1,
                         help='Parallel independent source-group extraction processes; runtime setting, not a recipe change')
+    parser.add_argument('--backup-dir', type=Path,
+                        help='Persistent checkpoints outside the local output; runtime setting, not a recipe change')
     parser.add_argument('--usage', choices=('research',), default='research',
                         help='This release route retains pending permission evidence; commercial preparation uses the audited adapter separately')
     parser.add_argument('--rir-alignment', choices=('upstream-estimated-onset',), default='upstream-estimated-onset')
@@ -565,7 +612,8 @@ def main() -> None:
     _worker_count(args.materialize_workers, 'materialize_workers')
     plan = release_plan(args.root, args.source, args.output_dir, chunk_size=args.chunk_size,
                         max_speech_per_split=args.max_speech_per_split, validation_reuse_rir=args.validation_reuse_rir)
-    print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers)
+    print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers,
+                               backup_dir=args.backup_dir)
                 if args.execute else plan))
 
 

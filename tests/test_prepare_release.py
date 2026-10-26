@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import tarfile
 
 import numpy as np
@@ -81,6 +82,11 @@ def fake_renderer(monkeypatch):
             return output / 'manifest.jsonl'
         output.mkdir(parents=True)
         (output / 'test-plan.json').write_text(json.dumps(plan))
+        (output / 'plan.json').write_text(json.dumps(plan))
+        (output / 'simulation.yaml').write_text(yaml.safe_dump(plan['config']))
+        (output / 'render-runtime.json').write_text('{"fixture": "1"}\n')
+        (output / 'log').mkdir()
+        (output / 'log/meta.tsv').write_text('fixture deterministic metadata\n')
         split = plan['provenance']['split']
         noise_uid, noise = next(iter(plan['inventories']['noise'].items()))
         rir_uid = next(iter(plan['inventories']['rir']))
@@ -96,6 +102,7 @@ def fake_renderer(monkeypatch):
                          'noisy': entry['path'], 'clean': entry['path']})
         manifest = output / 'manifest.jsonl'
         manifest.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        (output / 'render-progress.jsonl').write_text(manifest.read_text())
         return manifest
     execute.worker_counts = []
     monkeypatch.setattr(release.prep, 'execute_preparation', execute)
@@ -374,3 +381,103 @@ def test_documented_generated_wind_ids_are_split_scoped_but_hashes_are_audited(t
         assert calls == []
     else:
         assert release.execute_release(plan)['training_pairs_ready'] is True
+
+
+def backup_receipts(directory):
+    return [json.loads(path.read_text()) for path in (directory / 'commits').glob('*.json')]
+
+
+def test_persistent_backup_restores_fixed_path_and_resumes_across_worker_changes(tmp_path, monkeypatch):
+    from realtime_use.preparation_backup import PreparationBackup, restore
+    root, source = fixture_release(tmp_path, monkeypatch)
+    fake_renderer(monkeypatch)
+    output, backup_dir = tmp_path / 'out', tmp_path / 'persistent'
+    plan = release.release_plan(root, source, output, chunk_size=1)
+    checkpoint = PreparationBackup.checkpoint
+    def check_ready_publication(self, unit, paths, identity_paths):
+        assert not (output / 'READY.json').exists()
+        if unit == 'final':
+            assert (output / 'READY.pending.json').is_file()
+        return checkpoint(self, unit, paths, identity_paths)
+    monkeypatch.setattr(PreparationBackup, 'checkpoint', check_ready_publication)
+    result = release.execute_release(plan, backup_dir=backup_dir, materialize_workers=2)
+    request = (output / 'request.json').read_bytes()
+    expected = {path.relative_to(output): release.prep.sha256(path)
+                for path in output.rglob('*') if path.is_file()
+                and (path.suffix == '.wav' or path.name in {'manifest.jsonl', 'READY.json', 'request.json'})}
+    receipts = backup_receipts(backup_dir)
+    assert {record['unit'] for record in receipts} == {
+        'root', 'final', *(f'materialized/{key}' for key in plan['groups']),
+        *(f'chunks/{split}/{index:06d}' for split in ('validation', 'train') for index in range(3))}
+    archives = {path.name: path.stat().st_mtime_ns for path in (backup_dir / 'objects').iterdir()}
+    # Materialization reports naturally change extracted/reused counts on resume.
+    # Renderer timing/provenance changes likewise must not duplicate the backup.
+    for path in (output / 'chunks').glob('*/*'):
+        (path / 'provenance.json').write_text('{"elapsed_seconds": 999, "workers": 3}\n')
+    assert release.execute_release(plan, backup_dir=backup_dir, workers=3) == result
+    assert (output / 'request.json').read_bytes() == request
+    assert {path.name: path.stat().st_mtime_ns for path in (backup_dir / 'objects').iterdir()} == archives
+    assert len(backup_receipts(backup_dir)) == len(receipts)
+    assert json.loads((output / 'execution.json').read_text())['backup_dir'] == str(backup_dir)
+    assert 'backup_dir' not in json.loads(request)
+
+    shutil.rmtree(output)
+    restore(backup_dir, output)
+    assert {relative: release.prep.sha256(output / relative) for relative in expected} == expected
+    # Source archives stay outside the preparation backup and are still needed.
+    assert (root / 'release/RELEASE.json').is_file()
+    assert release.execute_release(plan, backup_dir=backup_dir, workers=2) == result
+    assert len(backup_receipts(backup_dir)) == len(receipts)
+    # Selecting another persistent destination does not change the recipe.
+    alternate = tmp_path / 'other-persistent'
+    assert release.execute_release(plan, backup_dir=alternate) == result
+    assert (output / 'request.json').read_bytes() == request
+    assert len(backup_receipts(alternate)) == len(receipts)
+
+
+@pytest.mark.parametrize('failure_unit', ['root', 'materialized/', 'chunks/validation/000001', 'final'])
+def test_backup_failure_stops_preparation_without_ready(tmp_path, monkeypatch, failure_unit):
+    import multiprocessing
+    from realtime_use.preparation_backup import PreparationBackup, restore
+    root, source = fixture_release(tmp_path, monkeypatch)
+    calls, _ = fake_renderer(monkeypatch)
+    output, backup_dir = tmp_path / 'out', tmp_path / 'persistent'
+    plan = release.release_plan(root, source, output, chunk_size=1)
+    checkpoint = PreparationBackup.checkpoint
+    existing = {process.pid for process in multiprocessing.active_children()}
+    def fail_checkpoint(self, unit, paths, identity_paths):
+        if unit == failure_unit or (failure_unit == 'materialized/' and unit.startswith(failure_unit)):
+            assert not (output / 'READY.json').exists()
+            raise OSError('persistent backup unavailable')
+        return checkpoint(self, unit, paths, identity_paths)
+    monkeypatch.setattr(PreparationBackup, 'checkpoint', fail_checkpoint)
+    with pytest.raises(OSError, match='persistent backup unavailable'):
+        release.execute_release(plan, backup_dir=backup_dir, materialize_workers=2)
+    assert not (output / 'READY.json').exists()
+    assert 'final' not in {record['unit'] for record in backup_receipts(backup_dir)}
+    assert {process.pid for process in multiprocessing.active_children()} <= existing
+    if failure_unit in ('root', 'materialized/'):
+        assert calls == []
+    if failure_unit == 'materialized/':
+        assert len(list((output / 'materialized').iterdir())) <= 2
+    if failure_unit == 'chunks/validation/000001':
+        shutil.rmtree(output)
+        restore(backup_dir, output)
+        assert not (output / 'READY.json').exists()
+        assert (output / 'chunks/validation/000000/manifest.jsonl').is_file()
+        assert not (output / 'chunks/validation/000001').exists()
+        monkeypatch.setattr(PreparationBackup, 'checkpoint', checkpoint)
+        assert release.execute_release(plan, backup_dir=backup_dir)['training_pairs_ready'] is True
+
+
+def test_overlapping_backup_directory_rejected_without_invalidating_ready(tmp_path, monkeypatch):
+    root, source = fixture_release(tmp_path, monkeypatch)
+    fake_renderer(monkeypatch)
+    output = tmp_path / 'out'
+    plan = release.release_plan(root, source, output)
+    release.execute_release(plan)
+    ready = (output / 'READY.json').read_bytes()
+    for backup_dir in (output, output / 'backup', tmp_path):
+        with pytest.raises(ValueError, match='must not overlap'):
+            release.execute_release(plan, backup_dir=backup_dir)
+        assert (output / 'READY.json').read_bytes() == ready
