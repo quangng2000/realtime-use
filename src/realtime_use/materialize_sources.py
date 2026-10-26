@@ -210,7 +210,10 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
                 if text is not None and (not isinstance(text, str) or '\n' in text or '\r' in text):
                     raise ValueError('Transcripts must be single-line text')
             suffix = PurePosixPath(member).suffix.lower()
-            if suffix not in {'.wav', '.flac', '.ogg', '.opus', '.aiff', '.aif'}:
+            # The official FMA resampler preserves original MP3 bytes when the
+            # sample rate is unchanged. SoundFile verifies/decodes them below;
+            # only the existing first-channel policy may produce a float WAV.
+            if suffix not in {'.wav', '.flac', '.ogg', '.opus', '.aiff', '.aif', '.mp3'}:
                 raise ValueError(f'Unsupported source audio suffix: {suffix}')
             if row['channels'] > 1:
                 suffix = '.wav'

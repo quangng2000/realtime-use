@@ -18,6 +18,13 @@ Add `--execute` to materialize that selection. For the complete pool, omit `--ma
 
 The default `--channel-policy reject` requires mono sources. Use `--channel-policy first` explicitly for multichannel sources such as WHAM noise or measured RIRs. This follows official URGENT's `read_audio(force_1ch=True)` choice of channel zero. Original archived bytes are verified first, including finite samples in all channels. Multichannel sources become mono float32 WAV files containing exactly their decoded first channel. Mono sources retain their original bytes. No channel averaging or resampling occurs.
 
+Original MP3 members are supported, including FMA files retained by the official
+resampler when their sample rate is unchanged. The preparation environment's
+SoundFile/libsndfile must support MP3 decoding. Mono MP3 files retain their exact
+archived bytes and SHA-256; multichannel MP3 files use the same explicit
+first-channel float32 WAV conversion after source verification. No MP3 re-encoding
+or additional lossy compression occurs.
+
 The output contains:
 
 - `audio/`: verified original mono files or explicit first-channel float WAV derivatives, named by a hash of corpus and source identity.

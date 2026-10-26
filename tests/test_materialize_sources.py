@@ -288,6 +288,79 @@ def test_first_channel_resume_requires_matching_original_source_verification(tmp
         materialize(make_plan(root, manifest, tmp_path / 'out', 'speech', channel_policy='first'))
 
 
+def mp3_pool(tmp_path, channels):
+    if not sf.check_format('MP3', 'MPEG_LAYER_III'):
+        pytest.skip('Real MP3 fixtures require a SoundFile/libsndfile build with MP3 encoding')
+    root, manifest, rows = pool(tmp_path, source='fma', role='noise', count=1)
+    time = np.arange(4410, dtype=np.float32) / 44100
+    waveform = np.stack([.2 * np.sin(2 * np.pi * frequency * time)
+                         for frequency in (440, 770)[:channels]], axis=1)
+    encoded = io.BytesIO()
+    sf.write(encoded, waveform, 44100, format='MP3', subtype='MPEG_LAYER_III')
+    raw = encoded.getvalue()
+    decoded, rate = sf.read(io.BytesIO(raw), dtype='float32', always_2d=True)
+    rows[0].update(path='audio/fma_000002.mp3', source_id='fma_000002',
+                   sample_rate=rate, frames=decoded.shape[0], channels=decoded.shape[1],
+                   sha256=hashlib.sha256(raw).hexdigest())
+    with tarfile.open(root / rows[0]['shard'], 'w') as archive:
+        member = tarfile.TarInfo(rows[0]['path'])
+        member.size = len(raw)
+        archive.addfile(member, io.BytesIO(raw))
+    rewrite(manifest, rows)
+    return root, manifest, rows[0], raw, decoded
+
+
+@pytest.mark.parametrize('channels', [1, 2])
+def test_real_fma_mp3_materialization_preserves_identity_and_exact_decoded_first_channel(tmp_path, channels):
+    root, manifest, original, raw, decoded = mp3_pool(tmp_path, channels)
+    out = tmp_path / 'out'
+    plan = make_plan(root, manifest, out, 'noise', channel_policy='first')
+    materialize(plan)
+    record = json.loads((out / 'records.jsonl').read_text())
+    path = Path(record['materialized_path'])
+    samples, rate = sf.read(path, dtype='float32', always_2d=True)
+    np.testing.assert_array_equal(samples, decoded[:, :1])
+    assert samples.shape == (original['frames'], 1) and rate == original['sample_rate'] == 44100
+    assert record['sha256'] == record['source_sha256'] == original['sha256']
+    assert record['source_id'] == original['source_id']
+    assert record['license'] == original['license']
+    assert record['commercial_clearance'] == original['commercial_clearance']
+    assert record['source_channels'] == channels and record['materialized_channels'] == 1
+    assert record['materialized_sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+    if channels == 1:
+        assert path.suffix == '.mp3' and path.read_bytes() == raw
+        assert record['channel_transform'] == 'identity'
+        assert record['materialized_sha256'] == original['sha256']
+    else:
+        assert path.suffix == '.wav' and sf.info(path).subtype == 'FLOAT'
+        assert record['channel_transform'] == 'first_channel_float32_wav'
+        assert record['materialized_sha256'] != original['sha256']
+        assert not np.array_equal(decoded[:, :1], decoded[:, 1:])
+    # The preparation adapter reads either materialized format without a suffix filter.
+    assert read_scp(out / 'source.scp') == {'fma:fma_000002': (44100, path)}
+    request = (out / 'request.json').read_bytes()
+    before = path.stat().st_mtime_ns
+    resumed = materialize(make_plan(root, manifest, out, 'noise', channel_policy='first'))
+    assert resumed['reused'] == 1 and resumed['extracted'] == 0
+    assert path.stat().st_mtime_ns == before and (out / 'request.json').read_bytes() == request
+    # Hash verification remains mandatory even when the format is compressed.
+    with path.open('ab') as handle:
+        handle.write(b'corruption')
+    with pytest.raises(ValueError, match='checksum mismatch'):
+        materialize(make_plan(root, manifest, out, 'noise', channel_policy='first'))
+
+
+@pytest.mark.parametrize('field,value', [('sha256', '0' * 64), ('frames', 1), ('sample_rate', 8000)])
+def test_real_mp3_invalid_source_evidence_is_rejected_before_inventory(tmp_path, field, value):
+    root, manifest, row, _, _ = mp3_pool(tmp_path, 1)
+    row[field] = value
+    rewrite(manifest, [row])
+    with pytest.raises(ValueError, match='checksum mismatch|metadata mismatch'):
+        materialize(make_plan(root, manifest, tmp_path / 'out', 'noise'))
+    assert not (tmp_path / 'out/source.scp').exists()
+    assert list((tmp_path / 'out/audio').iterdir()) == []
+
+
 def test_channel_policy_is_part_of_resume_identity_even_for_mono_sources(tmp_path):
     root, manifest, _ = pool(tmp_path)
     materialize(make_plan(root, manifest, tmp_path / 'out', 'speech', channel_policy='first'))
