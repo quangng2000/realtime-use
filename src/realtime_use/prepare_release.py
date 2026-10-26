@@ -432,7 +432,11 @@ def _invalidate_ready(output: Path) -> None:
         os.replace(ready, previous)
 
 
-def audit_materialized_sources(plan, materialized):
+def _record_path(result):
+    return Path(result.get('records', Path(result['output_dir']) / 'records.jsonl'))
+
+
+def audit_materialized_sources(plan, materialized, *, noise_holdout_hashes=frozenset()):
     """Reject train/validation source leakage before expensive pair rendering."""
     seen = {key: {} for key in ('speech_uid', 'speaker_id', 'speech_materialized_sha256',
                                 'noise_uid', 'noise_materialized_sha256')}
@@ -442,7 +446,7 @@ def audit_materialized_sources(plan, materialized):
         role, split = group['role'], group['split']
         if role == 'rir':  # The official recipe shares the same RIR pool.
             continue
-        for row in _rows(Path(result['output_dir']) / 'records.jsonl'):
+        for row in _rows(_record_path(result)):
             checksum = row.get('materialized_sha256')
             if not isinstance(checksum, str) or not re.fullmatch(r'[0-9a-f]{64}', checksum):
                 raise ValueError('Materialized source records require verified output hashes')
@@ -455,17 +459,110 @@ def audit_materialized_sources(plan, materialized):
             for field, identity in identities.items():
                 if not identity:
                     raise ValueError(f'Missing materialized source identity: {field}')
-                previous_split = seen[field].get(identity)
-                if previous_split is not None and previous_split != split:
-                    raise ValueError(f'Early split leakage: {field}={identity!r} occurs in {previous_split} and {split}')
-                seen[field][identity] = split
+                previous = seen[field].setdefault(identity, set())
+                for previous_split, previous_role in previous:
+                    if previous_split != split and not (
+                        field == 'noise_materialized_sha256' and identity in noise_holdout_hashes
+                        and role == previous_role == 'noise'
+                    ):
+                        raise ValueError(f'Early split leakage: {field}={identity!r} occurs in {previous_split} and {split}')
+                previous.add((split, role))
             counts[f'{role}_{split}'] += 1
     return {'status': 'passed', 'records': dict(counts), 'checks': list(seen),
             'hash_scope': 'Verified materialized output-file bytes after any channel normalization; different encodings of equivalent audio may evade this check.',
             'rir_policy': 'Shared pool permitted; RIR identity is excluded from leakage checks.'}
 
 
-def _split_plan(plan, materialized, split):
+def _noise_overlap_preflight(output, policy):
+    if policy not in ('error', 'validation-holdout'):
+        raise ValueError('noise_overlap_policy must be error or validation-holdout')
+    directory = output / 'source-selection'
+    manifest = directory / 'manifest.json'
+    if directory.is_symlink() or manifest.is_symlink():
+        raise ValueError('Source selection cannot be a symlink')
+    if directory.exists() and any(path.is_symlink() for path in directory.rglob('*')):
+        raise ValueError('Source selection cannot contain symlinks')
+    if policy == 'error':
+        if directory.exists():
+            raise ValueError('Existing source selection requires its frozen noise overlap policy')
+    elif manifest.exists():
+        if json.loads(manifest.read_text()).get('policy') != policy:
+            raise ValueError('Existing source selection uses a different noise overlap policy')
+    elif any((output / name).exists() for name in (
+        'settings', 'chunks', 'chunk-inputs', 'manifests', 'READY.json', 'last-successful-ready.json'
+    )):
+        raise ValueError('Cannot introduce noise holdout selection after rendering artifacts exist')
+
+
+def _select_noise_holdout(plan, materialized, *, selection_dir=None):
+    """Freeze exact noise duplicates; an isolated directory supports preflight."""
+    output = Path(plan['output_dir'])
+    directory = Path(selection_dir) if selection_dir is not None else output / 'source-selection'
+    validation = defaultdict(list)
+    inputs, original_counts = {}, defaultdict(int)
+    for key, result in materialized.items():
+        group = plan['groups'][key]
+        records = _record_path(result)
+        inputs[key] = {'records': str(records.relative_to(output)), 'records_sha256': prep.sha256(records),
+                       'scp': str(Path(result['scp']).relative_to(output)),
+                       'scp_sha256': prep.sha256(Path(result['scp']))}
+        if group['role'] == 'noise' and group['split'] == 'validation':
+            for row in _rows(records):
+                validation[row['materialized_sha256']].append({
+                    'group': key, 'uid': row['uid'], 'source_sha256': row['sha256']})
+    # Check every original identity first, permitting only the precise waveform
+    # overlap this policy removes. UID, speech and wind leakage remain errors,
+    # including collisions involving a row subsequently excluded from sampling.
+    original_audit = audit_materialized_sources(plan, materialized, noise_holdout_hashes=set(validation))
+    original_counts.update(original_audit['records'])
+    effective, exclusions, selections = dict(materialized), [], {}
+    for key, result in materialized.items():
+        group = plan['groups'][key]
+        if (group['role'], group['split']) != ('noise', 'train'):
+            continue
+        selected, count = [], 0
+        for row in _rows(_record_path(result)):
+            count += 1
+            checksum = row['materialized_sha256']
+            if checksum in validation:
+                exclusions.append({'group': key, 'uid': row['uid'],
+                    'source_sha256': row['sha256'], 'materialized_sha256': checksum,
+                    'reason': 'exact_materialized_bytes_in_validation_noise',
+                    'validation_matches': validation[checksum]})
+            else:
+                selected.append(row)
+        if not selected:
+            raise ValueError(f'Noise holdout selection exhausts training corpus: {key}')
+        records, scp = directory / key / 'records.jsonl', directory / key / 'source.scp'
+        _write(records, (json.dumps(row, ensure_ascii=False) + '\n' for row in selected))
+        _write(scp, (f'{row["uid"]} {row["sample_rate"]} {row["materialized_path"]}\n' for row in selected))
+        effective[key] = {**result, 'records': str(records), 'scp': str(scp)}
+        selections[key] = {'original_count': count, 'selected_count': len(selected),
+                           'records': str(records.relative_to(directory)), 'records_sha256': prep.sha256(records),
+                           'scp': str(scp.relative_to(directory)), 'scp_sha256': prep.sha256(scp)}
+    rates = {row['sample_rate'] for key, result in effective.items()
+             if (plan['groups'][key]['role'], plan['groups'][key]['split']) == ('noise', 'train')
+             for row in _rows(_record_path(result))}
+    speech_rates = {rate for group in plan['groups'].values()
+                    if (group['role'], group['split']) == ('speech', 'train') for rate in group['sample_rates']}
+    if any(not any(noise_rate >= rate for noise_rate in rates) for rate in speech_rates):
+        raise ValueError('Noise holdout selection leaves insufficient training sample-rate coverage')
+    # Publish the selection manifest last. Neither source metadata nor audio is
+    # edited; source order, validation pools, and speech cardinality are retained.
+    effective_counts = {**original_counts, 'noise_train': original_counts['noise_train'] - len(exclusions)}
+    manifest = directory / 'manifest.json'
+    _write(manifest, _json({'format_version': 1, 'policy': 'validation-holdout',
+        'request_sha256': prep.sha256(output / 'request.json'), 'release_sha256': plan['release_sha256'],
+        'source_commit': plan['source_commit'], 'inputs': inputs, 'selected_train_noise': selections,
+        'exclusions': exclusions, 'excluded_count': len(exclusions),
+        'original_counts': dict(original_counts), 'effective_counts': effective_counts,
+        'speech_pair_counts': {split: plan['selected_counts'][f'speech_{split}'] for split in ('train', 'validation')},
+        'hash_scope': original_audit['hash_scope']}))
+    binding = {'policy': 'validation-holdout', 'manifest': str(manifest), 'sha256': prep.sha256(manifest)}
+    return effective, binding
+
+
+def _split_plan(plan, materialized, split, source_selection=None):
     source, output = Path(plan['source']), Path(plan['output_dir'])
     config, _ = _template(source, split)
     evidence = []
@@ -481,7 +578,7 @@ def _split_plan(plan, materialized, split):
                              'license': '; '.join(group['licenses']), 'commercial_use': None,
                              'license_evidence': {'source_completion': str(Path(plan['root']) / plan['markers'][group['source']]['path']),
                                                   'source_completion_sha256': plan['markers'][group['source']]['sha256'],
-                                                  'record_metadata': str(Path(result['output_dir']) / 'records.jsonl')}})
+                                                  'record_metadata': str(_record_path(result))}})
             if role == 'speech':
                 config['speech_utt2spk'].append(str(Path(result['output_dir']) / 'utt2spk'))
                 config['speech_text'].append(str(Path(result['output_dir']) / 'text'))
@@ -492,6 +589,7 @@ def _split_plan(plan, materialized, split):
     config_path, provenance_path = settings / 'simulation.yaml', settings / 'provenance.json'
     _write(config_path, yaml.safe_dump(config, sort_keys=False))
     _write(provenance_path, _json({'split': split, 'sources': evidence,
+                                  **({'source_selection': source_selection} if source_selection else {}),
                                   'source_release': str(Path(plan['root']) / 'release/RELEASE.json'),
                                   'selection_scope': plan['selection_scope'], 'commercial_clearance': 'pending'}))
     result = prep.preparation_plan(source, config_path, provenance_path, output / 'chunks' / split,
@@ -628,7 +726,9 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
                     backup_compression: str = 'none',
                     backup_workers: int = 1,
                     overlap_materialized_backups: bool = False,
-                    materialized_backup_mode: str = 'full') -> dict[str, Any]:
+                    materialized_backup_mode: str = 'full',
+                    noise_overlap_policy: str = 'error') -> dict[str, Any]:
+    _noise_overlap_preflight(Path(plan['output_dir']), noise_overlap_policy)
     workers = _worker_count(workers, 'workers')
     materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
     if not isinstance(overlap_backups, bool):
@@ -697,8 +797,18 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
                                        overlap_materialized_backups=overlap_materialized_backups,
                                        materialized_backup_mode=materialized_backup_mode)
     _progress(output, stage='auditing_materialized_sources')
+    source_selection = None
+    if noise_overlap_policy == 'validation-holdout':
+        materialized, source_selection = _select_noise_holdout(plan, materialized)
     source_audit = audit_materialized_sources(plan, materialized)
+    if source_selection:
+        source_audit['source_selection'] = source_selection
     _write(output / 'source-split-audit.json', _json(source_audit))
+    selection_files = []
+    if source_selection:
+        selection_files = sorted(path for path in (output / 'source-selection').rglob('*') if path.is_file())
+        if backup is not None:
+            backup.checkpoint('source-selection', [output / 'source-selection'], selection_files)
     combined, counts, rendered = {}, {}, {}
     # Validate/render the constrained validation RIR recipe before committing
     # potentially days of work to the much larger training split.
@@ -706,7 +816,8 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     with signal_guard, _ChunkBackups(backup, overlap_backups, backup_workers) as checkpoints:
         for split in ('validation', 'train'):
             checkpoints.check()
-            base = _split_plan(plan, materialized, split)
+            base = (_split_plan(plan, materialized, split, source_selection) if source_selection
+                    else _split_plan(plan, materialized, split))
             speech = list(base['inventories']['speech'])
             size, used_rirs, manifests = plan['chunk_size'], set(), []
             for index, start in enumerate(range(0, len(speech), size)):
@@ -762,6 +873,7 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
               'source_release_status': plan['source_release_status'], 'incomplete_sources': plan['incomplete_sources'],
               'omitted_sources': plan['omitted_sources'], 'examples': counts, 'audit': audit,
               'source_audit': source_audit,
+              **({'source_selection': source_selection} if source_selection else {}),
               'request_sha256': prep.sha256(output / 'request.json'), 'rir_alignment': plan['rir_alignment'],
               'manifests': {split: {'path': str(path), 'sha256': prep.sha256(path)} for split, path in combined.items()},
               'hydra_data_paths': str(output / 'data-paths.yaml')}
@@ -773,7 +885,7 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
         ready = output / 'READY.pending.json'
         _write(ready, _json(result))
         final_paths = [output / 'manifests', output / 'source-split-audit.json',
-                       output / 'split-audit.json', output / 'data-paths.yaml', ready]
+                       output / 'split-audit.json', output / 'data-paths.yaml', ready, *selection_files]
         final_identity = [*combined.values(), *final_paths[1:]]
         backup.checkpoint('final', final_paths, final_identity)
         os.replace(ready, output / 'READY.json')
@@ -808,6 +920,8 @@ def main() -> None:
     parser.add_argument('--rir-alignment', choices=('upstream-estimated-onset',), default='upstream-estimated-onset')
     parser.add_argument('--max-speech-per-split', type=int, help='Explicit first-N readiness subset; use a distinct output')
     parser.add_argument('--validation-reuse-rir', action='store_true', help='Explicitly permit validation RIR reuse; changes the official validation recipe')
+    parser.add_argument('--noise-overlap-policy', choices=('error', 'validation-holdout'), default='error',
+                        help='Reject noise leakage, or freeze exact validation-noise duplicates out of the training noise pool before any rendering')
     parser.add_argument('--execute', action='store_true', help='Prepare local audio and paired manifests; never train')
     args = parser.parse_args()
     _worker_count(args.workers, 'workers')
@@ -818,8 +932,9 @@ def main() -> None:
                                backup_dir=args.backup_dir, overlap_backups=args.overlap_backups,
                                overlap_materialized_backups=args.overlap_materialized_backups,
                                materialized_backup_mode=args.materialized_backup_mode,
-                               backup_compression=args.backup_compression, backup_workers=args.backup_workers)
-                if args.execute else plan))
+                               backup_compression=args.backup_compression, backup_workers=args.backup_workers,
+                               noise_overlap_policy=args.noise_overlap_policy)
+                if args.execute else {**plan, 'noise_overlap_policy': args.noise_overlap_policy}))
 
 
 if __name__ == '__main__':

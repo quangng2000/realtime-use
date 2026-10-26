@@ -55,3 +55,27 @@ generated UID by split while preserving the raw source ID and waveform hashes.
 The release bridge selects this policy for the recorded SC-Wind-Noise-Generator
 source. Identical train/validation waveform hashes still fail the leakage audit.
 Recorded speech and noise retain global source identities.
+
+The release driver defaults to `--noise-overlap-policy error`: any detected
+train/validation recording overlap stops preparation before pair rendering. If
+ordinary noise pools contain identical materialized files, explicitly selecting
+`--noise-overlap-policy validation-holdout` preserves the entire validation pool
+and excludes those exact duplicates from training-noise sampling only. Speech
+pair counts stay unchanged. URGENT's existing `reuse_noise: true` sampler accepts
+the remaining pool; empty corpus pools or insufficient sample-rate coverage fail.
+Speech, speaker, wind, and UID collisions still fail the strict audit.
+
+This policy must be selected before any settings or rendering artifacts exist.
+It leaves original archives, release indices, materialization requests, records,
+SCPs, and extracted audio unchanged. `source-selection/manifest.json` records the
+policy, input hashes, every excluded training UID and its validation match,
+counts before/after selection, and hashes of the derived training-noise records
+and SCPs. This immutable selection supplements the original source request and
+is bound into both split recipes, chunk provenance, and final readiness evidence.
+Use the same explicit policy when resuming; changing or omitting it is rejected.
+
+With persistent backups, the complete selection receives its own verified
+checkpoint before rendering and is also included in the final backup. Restoring
+the original absolute output path recovers the selection along with the paired
+data. This check compares exact materialized file bytes; differently encoded
+copies of the same sound can require a separate content-level audit.
