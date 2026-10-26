@@ -43,6 +43,12 @@ Pass the resulting `source.scp` files to `speech_scps`, `noise_scps`, `rir_scps`
 
 Materialization does not invent `commercial_use:true`, license evidence, or audited RIR direct-path delays. Supply those records separately under the preparation route's selected permission policy. Native-rate audio coverage, source split design, RIR timing, and the official simulator environment still need validation before rendering paired manifests. Run `prepare_data audit-splits` on the generated train/validation manifests before use.
 
+For MLS only, boundary ASCII spaces in the raw `speaker_id` are removed when
+forming `materialized_speaker_id`. The pinned upstream `utt2spk` script emits a
+trailing space by printing an empty third field. Raw metadata and source hashes
+are preserved. Blank identities, internal whitespace, and control characters
+remain invalid; other corpora retain their existing strict validation.
+
 Independently generated wind pools may restart their filename counters for each
 split. For those pools only, explicit `--wind-id-scope split` namespaces the
 generated UID by split while preserving the raw source ID and waveform hashes.

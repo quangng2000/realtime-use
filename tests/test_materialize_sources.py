@@ -395,6 +395,70 @@ def test_mls_speaker_namespaces_include_language_without_overwriting_raw_speaker
     assert {r['materialized_speaker_id'] for r in records} == {'mls:german:123', 'mls:french:123'}
 
 
+@pytest.mark.parametrize('raw_speaker', ['10032 ', ' 10032', '  10032  '])
+def test_mls_upstream_boundary_spaces_preserve_source_metadata_and_resume(tmp_path, raw_speaker):
+    root, manifest, rows = pool(tmp_path, source='mls', count=1)
+    rows[0].update(source_id='mls_french_10032_9061_000004',
+                   id='mls/train/mls_french_10032_9061_000004', speaker_id=raw_speaker)
+    rewrite(manifest, rows)
+    source_bytes = manifest.read_bytes()
+    archive_hash = hashlib.sha256((root / rows[0]['shard']).read_bytes()).hexdigest()
+    output = tmp_path / 'out'
+    plan = make_plan(root, manifest, output, 'speech')
+    assert plan['records'][0]['speaker_id'] == raw_speaker
+    assert plan['records'][0]['materialized_speaker_id'] == 'mls:french:10032'
+    assert plan['source_manifest_sha256'] == hashlib.sha256(source_bytes).hexdigest()
+    materialize(plan)
+    assert (output / 'utt2spk').read_text() == 'mls:mls_french_10032_9061_000004 mls:french:10032\n'
+    record = json.loads((output / 'records.jsonl').read_text())
+    assert all(record[key] == value for key, value in rows[0].items())
+    request, records = (output / 'request.json').read_bytes(), (output / 'records.jsonl').read_bytes()
+    resumed = materialize(make_plan(root, manifest, output, 'speech'))
+    assert resumed['reused'] == 1 and resumed['extracted'] == 0
+    assert (output / 'request.json').read_bytes() == request
+    assert (output / 'records.jsonl').read_bytes() == records
+    assert manifest.read_bytes() == source_bytes
+    assert hashlib.sha256((root / rows[0]['shard']).read_bytes()).hexdigest() == archive_hash
+
+
+@pytest.mark.parametrize('speaker', ['', '   ', '100 32', '100\t32', '\t10032 ',
+                                    '10032\n', '10032\r ', '10032\0', None, 10032])
+def test_mls_canonicalization_rejects_blank_internal_whitespace_and_controls(tmp_path, speaker):
+    root, manifest, rows = pool(tmp_path, source='mls', count=1)
+    rows[0].update(source_id='mls_french_10032_9061_000004', speaker_id=speaker)
+    rewrite(manifest, rows)
+    with pytest.raises(ValueError, match='speaker_id'):
+        make_plan(root, manifest, tmp_path / 'out', 'speech')
+    assert not (tmp_path / 'out').exists()
+
+
+def test_mls_boundary_spaces_do_not_collapse_language_namespaces(tmp_path):
+    root, manifest, rows = pool(tmp_path, source='mls', count=2)
+    for row, language in zip(rows, ['german', 'french']):
+        row.update(source_id=f'mls_{language}_10032_9061_000004', speaker_id='10032 ')
+    rewrite(manifest, rows)
+    plan = make_plan(root, manifest, tmp_path / 'out', 'speech')
+    assert {row['materialized_speaker_id'] for row in plan['records']} == {'mls:german:10032', 'mls:french:10032'}
+    assert all(row['speaker_id'] == '10032 ' for row in plan['records'])
+
+
+@pytest.mark.parametrize('source', ['libritts', 'vctk'])
+def test_non_mls_speaker_identity_and_request_validation_remain_unchanged(tmp_path, source):
+    root, manifest, rows = pool(tmp_path, source=source, count=1)
+    output = tmp_path / 'out'
+    plan = make_plan(root, manifest, output, 'speech')
+    assert plan['records'][0]['materialized_speaker_id'] == rows[0]['speaker_id']
+    materialize(plan)
+    request = (output / 'request.json').read_bytes()
+    assert json.loads(request) == {key: value for key, value in plan.items() if key != 'records'}
+    assert materialize(make_plan(root, manifest, output, 'speech'))['reused'] == 1
+    assert (output / 'request.json').read_bytes() == request
+    rows[0]['speaker_id'] += ' '
+    rewrite(manifest, rows)
+    with pytest.raises(ValueError, match='speaker_id'):
+        make_plan(root, manifest, tmp_path / 'different', 'speech')
+
+
 def test_shard_location_is_validated_once_per_plan_but_never_cached_across_plans(tmp_path, monkeypatch):
     root, manifest, rows = pool(tmp_path, count=30)
     shard = root.resolve() / rows[0]['shard']

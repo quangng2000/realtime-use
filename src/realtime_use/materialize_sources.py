@@ -233,7 +233,13 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
             seen_members.add((str(shard), member))
             materialized_speaker_id = None
             if role == 'speech':
-                materialized_speaker_id = _token(row.get('speaker_id'), 'speaker_id')
+                speaker = row.get('speaker_id')
+                if source == 'mls' and isinstance(speaker, str):
+                    # Pinned MLS utt2spk generation prints an empty third field,
+                    # leaving an ASCII space after the speaker. Retain the raw
+                    # record; canonicalize only its emitted speaker identity.
+                    speaker = speaker.strip(' ')
+                materialized_speaker_id = _token(speaker, 'speaker_id')
                 if source == 'mls':
                     parts = source_id.split('_', 2)
                     if len(parts) < 3 or parts[0] != 'mls' or not parts[1]:
