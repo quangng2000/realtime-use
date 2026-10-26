@@ -132,6 +132,14 @@ def _latest(receipts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _materialized_peer(unit: str) -> str | None:
+    for prefix, other in (('materialized/', 'materialized-metadata/'),
+                          ('materialized-metadata/', 'materialized/')):
+        if unit.startswith(prefix):
+            return other + unit[len(prefix):]
+    return None
+
+
 def _verify_archive(backup: Path, receipt: dict[str, Any]) -> Path:
     archive = receipt['archive']
     path = backup / _relative(archive['path'])
@@ -224,6 +232,27 @@ class PreparationBackup:
         previous = latest.get(unit)
         if previous is not None and previous['identity_sha256'] == identity:
             _verify_archive(self.backup_dir, previous)
+            peer = latest.get(_materialized_peer(unit))
+            if peer is not None and (peer['created_ns'], peer['receipt_sha256']) > (
+                previous['created_ns'], previous['receipt_sha256']
+            ):
+                # Switching back activates the existing verified scope without
+                # uploading its identical archive again. Other units retain
+                # their original receipt-reuse behavior.
+                receipt = {**previous, 'created_ns': max(time.time_ns(), peer['created_ns'] + 1)}
+                receipt['receipt_sha256'] = _hash_json({key: value for key, value in receipt.items()
+                                                       if key != 'receipt_sha256'})
+                encoded = _json(receipt)
+                commit = self.backup_dir / 'commits' / f'{uuid.uuid4().hex}.json'
+                with commit.open('xb') as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if commit.read_bytes() != encoded:
+                    raise ValueError('Backup activation receipt read-back check failed')
+                with self._receipt_lock:
+                    self._receipts.append(receipt)
+                return receipt
             return previous
         members = {}
         for path in [self.output_root / 'request.json', *paths, *identity_paths]:
@@ -372,6 +401,13 @@ def restore(backup_dir: Path, output_root: Path) -> dict[str, Any]:
         del selected['final']  # A resumed/incomplete run must not restore stale READY.
     ordered = sorted(selected, key=lambda unit: (unit == 'final', unit))
     archives = {unit: _verify_archive(backup, selected[unit]) for unit in ordered}
+    # Final dependencies and all archive hashes were checked against the full
+    # receipt set first. Full and metadata-only source scopes are alternatives;
+    # extracting both can conflict on diagnostic metadata changed by a resume.
+    ordered = [unit for unit in ordered if _materialized_peer(unit) not in selected or
+               (selected[unit]['created_ns'], selected[unit]['receipt_sha256']) >
+               (selected[_materialized_peer(unit)]['created_ns'],
+                selected[_materialized_peer(unit)]['receipt_sha256'])]
     output.mkdir(parents=True, exist_ok=True)
     if not output.is_dir():
         raise ValueError('Restore output must be a local directory')

@@ -75,6 +75,16 @@ uses lossless gzip level 1 for backup containers. Both options are execution
 settings and preserve sampled audio and recipe identity. A backup failure stops preparation,
 cleans up active materialization workers, and prevents publication of `READY.json`.
 
+`--materialized-backup-mode metadata` omits only duplicate extracted source audio
+from source-group checkpoints. The default `full` includes it. Metadata mode
+retains every other group file, including channel-verification sidecars, records,
+SCPs, transcripts, and speaker mappings. Generated clean/noisy pairs and final
+release checkpoints remain complete. Keep the separately verified original source
+release (archives, manifests, and completion markers) on persistent storage:
+recovering preparation after local disk loss requires re-extracting source audio.
+This runtime policy leaves the recipe unchanged and uses distinct
+`materialized-metadata/` receipt units. It does not require either overlap option.
+
 `--overlap-materialized-backups` independently enables source-stage overlap:
 exactly one extractor process and one closed-group backup worker. It requires
 `--backup-dir` and `--materialize-workers 1`, and allows at most two uncommitted

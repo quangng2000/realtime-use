@@ -85,19 +85,38 @@ def _verification(row: dict[str, Any], output_sha256: str) -> dict[str, Any]:
             'channel_transform': ('identity' if row['channels'] == 1 else 'first_channel_float32_wav')}
 
 
+def _read_verification(path: Path, row: dict[str, Any]) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f'Missing regular first-channel verification record: {row["id"]}')
+    metadata = json.loads(path.read_text())
+    output_hash = metadata.get('materialized_sha256', '')
+    if not re.fullmatch(r'[0-9a-f]{64}', output_hash) or metadata != _verification(row, output_hash):
+        raise ValueError(f'First-channel verification identity mismatch: {row["id"]}')
+    return metadata
+
+
+def _disable_peak_chunk(destination) -> None:
+    # FLOAT WAV's optional PEAK chunk contains wall-clock time. The documented
+    # libsndfile command must run before samples are written; audio is unchanged.
+    # SoundFile has no public wrapper, so use its existing libsndfile binding.
+    # https://libsndfile.github.io/libsndfile/command.html#sfc_set_add_peak_chunk
+    try:
+        enabled = sf._snd.sf_command(destination._file, 0x1050, sf._ffi.NULL, 0)
+        error = sf._snd.sf_error(destination._file)
+    except AttributeError as exc:
+        raise RuntimeError('SoundFile/libsndfile must support disabling the optional PEAK chunk') from exc
+    if enabled != 0 or error != 0:
+        raise RuntimeError('libsndfile could not disable the optional PEAK chunk')
+
+
 def _reuse_audio(target: Path, row: dict[str, Any], verification_dir: Path) -> None:
     if row['channels'] == 1:
         _verify_audio(target, row)
         row.update(_verification(row, row['sha256']))
         return
     metadata_path = verification_dir / (target.name + '.json')
-    if metadata_path.is_symlink() or not metadata_path.is_file():
-        raise ValueError(f'Missing regular first-channel verification record: {row["id"]}')
-    metadata = json.loads(metadata_path.read_text())
-    output_hash = metadata.get('materialized_sha256', '')
-    if not re.fullmatch(r'[0-9a-f]{64}', output_hash) or metadata != _verification(row, output_hash):
-        raise ValueError(f'First-channel verification identity mismatch: {row["id"]}')
-    _verify_audio(target, {**row, 'channels': 1, 'sha256': output_hash})
+    metadata = _read_verification(metadata_path, row)
+    _verify_audio(target, {**row, 'channels': 1, 'sha256': metadata['materialized_sha256']})
     row.update(metadata)
 
 
@@ -115,14 +134,21 @@ def _publish_audio(original: Path, target: Path, row: dict[str, Any], verificati
             normalized, mode='w', samplerate=row['sample_rate'], channels=1,
             format='WAV', subtype='FLOAT'
         ) as destination:
+            _disable_peak_chunk(destination)
             for block in source.blocks(blocksize=65536, dtype='float32', always_2d=True):
                 destination.write(block[:, :1])
         output_hash = file_sha256(normalized)
         _verify_audio(normalized, {**row, 'channels': 1, 'sha256': output_hash})
         metadata = _verification(row, output_hash)
+        metadata_path = verification_dir / (target.name + '.json')
+        if metadata_path.exists() or metadata_path.is_symlink():
+            previous = _read_verification(metadata_path, row)
+            if previous != metadata:
+                raise ValueError(f'Recreated first-channel audio differs from saved verification: {row["id"]}; '
+                                 'restore its original materialized audio instead of replacing its identity')
         # Publish verification first: a crash before the audio rename is safely
         # recoverable by re-extracting the still-missing output on the next run.
-        _atomic_text(verification_dir / (target.name + '.json'), json.dumps(metadata, indent=2) + '\n')
+        _atomic_text(metadata_path, json.dumps(metadata, indent=2) + '\n')
         os.replace(normalized, target)
         row.update(metadata)
     finally:

@@ -39,6 +39,32 @@ final receipt and does not restore its stale readiness marker.
 
 ## Throughput options
 
+`--materialized-backup-mode metadata` avoids uploading a second copy of extracted
+source audio. Default `full` retains source audio in the checkpoints. Metadata
+mode excludes only each materialized group's `audio/` subtree; every other file,
+including `verification/*.json`, `request.json`, `records.jsonl`, SCPs, text, and
+speaker mappings, remains backed up. Every generated clean/noisy pair, chunk
+metadata, audit, manifest, and final readiness snapshot is still backed up.
+This option requires a backup directory and a separate original source release
+root. The frozen request retains that root, its release checksum, and verified
+source-marker identities. Keep that entire independently verified original
+release on persistent storage; this option does not copy or replace it.
+
+After metadata-only restore, completed generated pairs remain available. Resume
+preparation at the original absolute output path to re-extract missing source
+audio from the retained archives. New normalized multichannel WAVs are written
+deterministically and checked against retained verification sidecars. Older
+normalized audio that contains a variable WAV timestamp may not reproduce its
+saved byte hash; that case fails closed and requires the original full source
+audio checkpoint. It never silently changes recorded hashes or render ledgers.
+
+Backup mode is an execution setting, not a recipe change. Full and metadata-only
+source checkpoints use separate `materialized/` and `materialized-metadata/`
+units. Recovery verifies final dependencies and all current archive checksums,
+then extracts the latest selected scope for each group. Switching back to an
+already verified scope publishes a new activation receipt without re-uploading
+the same archive. Older checkpoints are retained; no mode switch deletes them.
+
 `--overlap-backups` allows closed chunk checkpoints to run while the next chunk
 renders on local disk. `--backup-workers 1` (default) or `2` limits concurrent checkpoints; the queue
 is bounded and final readiness waits for every result. Materialization checkpoints remain synchronous by default; use `--materialize-workers 1`
@@ -112,7 +138,8 @@ They are not implicitly included in the paired-output checkpoint.
 
 ## Capacity and interruption limits
 
-The current release pipeline retains every materialized source and rendered pair.
+The active release pipeline retains every materialized source and rendered pair
+on local disk, including when its persistent source backups use metadata mode.
 Provision local capacity for those files, metadata, active worker scratch, and
 free-space headroom. Streaming backups do not require another full local tar.
 Restore stages the selected files locally; restoring into an empty output uses

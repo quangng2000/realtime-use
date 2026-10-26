@@ -279,7 +279,21 @@ def _abort_materializers(executor: ProcessPoolExecutor, pending) -> None:
     executor.shutdown(wait=True, cancel_futures=True)
 
 
-def _materialize_groups_overlapped(plan, partitions, backup):
+def _checkpoint_materialized(backup, output, key, mode):
+    directory = output / 'materialized' / key
+    identity = [directory / 'request.json', directory / 'records.jsonl']
+    if mode == 'full':
+        return backup.checkpoint(f'materialized/{key}', [directory], identity)
+    # Retain all metadata, including nested channel-verification sidecars and
+    # future metadata additions. Only the extracted audio subtree is omitted.
+    paths = [path for path in sorted(directory.iterdir()) if path.name != 'audio']
+    identity = [path for parent in paths
+                for path in (sorted(parent.rglob('*')) if parent.is_dir() else [parent])
+                if path.is_file() and path != directory / 'materialization.json']
+    return backup.checkpoint(f'materialized-metadata/{key}', paths, identity)
+
+
+def _materialize_groups_overlapped(plan, partitions, backup, materialized_backup_mode):
     """One extractor plus one closed-group backup; at most two uncommitted groups."""
     output = Path(plan['output_dir'])
     iterator, completed = iter(partitions.items()), {}
@@ -294,9 +308,8 @@ def _materialize_groups_overlapped(plan, partitions, backup):
             while True:
                 if backing is None and waiting is not None:
                     key, result = waiting
-                    directory = output / 'materialized' / key
-                    future = backup_pool.submit(backup.checkpoint, f'materialized/{key}', [directory],
-                                                [directory / 'request.json', directory / 'records.jsonl'])
+                    future = backup_pool.submit(_checkpoint_materialized, backup, output, key,
+                                                materialized_backup_mode)
                     backing, waiting = (key, result, future), None
                 if extracting is None and waiting is None and not exhausted:
                     following = next(iterator, None)
@@ -346,12 +359,13 @@ def _materialize_groups_overlapped(plan, partitions, backup):
 
 
 def _materialize_groups(plan, partitions, workers: int, *, backup=None,
-                        overlap_materialized_backups: bool = False):
+                        overlap_materialized_backups: bool = False,
+                        materialized_backup_mode: str = 'full'):
     """Bound in-flight jobs to workers and retain deterministic corpus order."""
     if overlap_materialized_backups:
         if backup is None or workers != 1:
             raise ValueError('Materialized backup overlap requires backup and materialize_workers=1')
-        return _materialize_groups_overlapped(plan, partitions, backup)
+        return _materialize_groups_overlapped(plan, partitions, backup, materialized_backup_mode)
     output = Path(plan['output_dir'])
     completed = {}
 
@@ -361,9 +375,7 @@ def _materialize_groups(plan, partitions, workers: int, *, backup=None,
 
     def completed_group(key, result):
         if backup is not None:
-            directory = output / 'materialized' / key
-            backup.checkpoint(f'materialized/{key}', [directory],
-                              [directory / 'request.json', directory / 'records.jsonl'])
+            _checkpoint_materialized(backup, output, key, materialized_backup_mode)
         completed[key] = result
 
     if workers == 1:
@@ -615,7 +627,8 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
                     overlap_backups: bool = False,
                     backup_compression: str = 'none',
                     backup_workers: int = 1,
-                    overlap_materialized_backups: bool = False) -> dict[str, Any]:
+                    overlap_materialized_backups: bool = False,
+                    materialized_backup_mode: str = 'full') -> dict[str, Any]:
     workers = _worker_count(workers, 'workers')
     materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
     if not isinstance(overlap_backups, bool):
@@ -626,6 +639,10 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
         raise ValueError('overlap_materialized_backups must be a boolean')
     if overlap_materialized_backups and (backup_dir is None or materialize_workers != 1):
         raise ValueError('Materialized backup overlap requires a backup directory and materialize_workers=1')
+    if materialized_backup_mode not in ('full', 'metadata'):
+        raise ValueError('materialized_backup_mode must be full or metadata')
+    if materialized_backup_mode == 'metadata' and backup_dir is None:
+        raise ValueError('Metadata-only materialized backups require a backup directory')
     if isinstance(backup_workers, bool) or not isinstance(backup_workers, int) or backup_workers not in (1, 2):
         raise ValueError('backup_workers must be 1 or 2')
     if backup_workers != 1 and not overlap_backups:
@@ -638,6 +655,11 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
         from .preparation_backup import validate_compression
         validate_compression(backup_compression)  # Fail before request/READY mutation.
     output = Path(plan['output_dir'])
+    source_root = Path(plan['root'])
+    if materialized_backup_mode == 'metadata' and (
+        source_root.is_relative_to(output) or output.is_relative_to(source_root)
+    ):
+        raise ValueError('Metadata-only backups require a separate original source release root')
     if backup_dir is not None:
         backup_dir = Path(backup_dir).expanduser().resolve()
         if backup_dir == output or backup_dir.is_relative_to(output) or output.is_relative_to(backup_dir):
@@ -662,6 +684,7 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
         'materialize_workers': materialize_workers, 'process_start_method': 'spawn',
         **({'backup_dir': str(backup_dir), 'overlap_backups': overlap_backups,
             'overlap_materialized_backups': overlap_materialized_backups,
+            'materialized_backup_mode': materialized_backup_mode,
             'backup_compression': backup_compression, 'backup_workers': backup_workers}
            if backup_dir is not None else {}),
         'training_started': False}), immutable=False)
@@ -671,7 +694,8 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
         backup.checkpoint('root', [output / 'request.json', output / 'indices'],
                           [output / 'request.json', *partitions.values()])
     materialized = _materialize_groups(plan, partitions, materialize_workers, backup=backup,
-                                       overlap_materialized_backups=overlap_materialized_backups)
+                                       overlap_materialized_backups=overlap_materialized_backups,
+                                       materialized_backup_mode=materialized_backup_mode)
     _progress(output, stage='auditing_materialized_sources')
     source_audit = audit_materialized_sources(plan, materialized)
     _write(output / 'source-split-audit.json', _json(source_audit))
@@ -773,6 +797,8 @@ def main() -> None:
                         help='Back up closed chunks while the next renders locally; requires --backup-dir')
     parser.add_argument('--overlap-materialized-backups', action='store_true',
                         help='Overlap one closed source-group backup with one extractor; requires --backup-dir and --materialize-workers 1')
+    parser.add_argument('--materialized-backup-mode', choices=('full', 'metadata'), default='full',
+                        help='Source checkpoints: full, or metadata with re-extraction from the separately retained original release after recovery')
     parser.add_argument('--backup-workers', type=int, choices=(1, 2), default=1,
                         help='Concurrent checkpoints; 2 requires --overlap-backups')
     parser.add_argument('--backup-compression', choices=('none', 'gzip', 'gzip-isal'), default='none',
@@ -791,6 +817,7 @@ def main() -> None:
     print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers,
                                backup_dir=args.backup_dir, overlap_backups=args.overlap_backups,
                                overlap_materialized_backups=args.overlap_materialized_backups,
+                               materialized_backup_mode=args.materialized_backup_mode,
                                backup_compression=args.backup_compression, backup_workers=args.backup_workers)
                 if args.execute else plan))
 
