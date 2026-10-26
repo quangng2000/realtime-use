@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import tarfile
 
 import numpy as np
@@ -11,6 +12,7 @@ import soundfile as sf
 
 from realtime_use.materialize_sources import make_plan, materialize
 from realtime_use.prepare_data import read_scp, audit_splits
+import realtime_use.materialize_sources as materializer
 
 
 def pool(tmp_path, *, source='vctk', split='train', count=2, role='speech'):
@@ -391,3 +393,85 @@ def test_mls_speaker_namespaces_include_language_without_overwriting_raw_speaker
     records = [json.loads(line) for line in (tmp_path / 'out/records.jsonl').read_text().splitlines()]
     assert {r['speaker_id'] for r in records} == {'123'}
     assert {r['materialized_speaker_id'] for r in records} == {'mls:german:123', 'mls:french:123'}
+
+
+def test_shard_location_is_validated_once_per_plan_but_never_cached_across_plans(tmp_path, monkeypatch):
+    root, manifest, rows = pool(tmp_path, count=30)
+    shard = root.resolve() / rows[0]['shard']
+    original_resolve, original_is_file = Path.resolve, Path.is_file
+    calls = {'resolve': 0, 'is_file': 0}
+    def resolve(path, *args, **kwargs):
+        if path == shard:
+            calls['resolve'] += 1
+        return original_resolve(path, *args, **kwargs)
+    def is_file(path):
+        if path == shard:
+            calls['is_file'] += 1
+        return original_is_file(path)
+    monkeypatch.setattr(Path, 'resolve', resolve)
+    monkeypatch.setattr(Path, 'is_file', is_file)
+    first = make_plan(root, manifest, tmp_path / 'out', 'speech')
+    assert calls == {'resolve': 1, 'is_file': 1}
+    assert first == make_plan(root, manifest, tmp_path / 'out', 'speech')
+    assert calls == {'resolve': 2, 'is_file': 2}
+    outside = tmp_path / 'outside.tar'
+    shard.rename(outside)
+    shard.symlink_to(outside)
+    with pytest.raises(ValueError, match='escapes the dataset root'):
+        make_plan(root, manifest, tmp_path / 'out', 'speech')
+    assert calls['resolve'] == 3
+
+
+def test_large_archive_buffer_reduces_underlying_reads_without_changing_any_outputs(tmp_path, monkeypatch):
+    root, manifest, rows = pool(tmp_path, count=1)
+    # The unselected tail is deliberate: every header must still be examined.
+    with tarfile.open(root / rows[0]['shard'], 'a') as archive:
+        tail = tarfile.TarInfo('unselected/payload.bin')
+        tail.size = 16 * 1024 * 1024
+        archive.addfile(tail, io.BytesIO(bytes(tail.size)))
+    out = tmp_path / 'out'
+    original_read = tarfile._LowLevelFile.read
+    counts, snapshots = [], []
+    for buffer_bytes in (10 * 1024, 1024 * 1024):
+        reads = []
+        def read(handle, size):
+            reads.append(size)
+            return original_read(handle, size)
+        with monkeypatch.context() as context:
+            context.setattr(tarfile._LowLevelFile, 'read', read)
+            context.setattr(materializer, '_ARCHIVE_BUFFER_BYTES', buffer_bytes)
+            materialize(make_plan(root, manifest, out, 'speech'))
+        counts.append(len(reads))
+        assert max(reads) <= buffer_bytes
+        snapshots.append({str(p.relative_to(out)): p.read_bytes()
+                          for p in out.rglob('*') if p.is_file()})
+        shutil.rmtree(out)
+    assert counts[0] > 1500 and counts[1] <= 20
+    assert counts[0] > 75 * counts[1]
+    # Includes audio, SCP, original/source hashes, metadata, and resume request.
+    assert snapshots[0] == snapshots[1]
+
+
+@pytest.mark.parametrize('kind', ['duplicate', 'symlink', 'traversal'])
+def test_large_buffer_still_rejects_unsafe_headers_after_selected_member(tmp_path, kind):
+    root, manifest, rows = pool(tmp_path, count=1)
+    shard = root / rows[0]['shard']
+    with tarfile.open(shard, 'r:') as archive:
+        raw = archive.extractfile(rows[0]['path']).read()
+    with tarfile.open(shard, 'a') as archive:
+        tail = tarfile.TarInfo('unselected/payload.bin')
+        tail.size = 9 * 1024 * 1024
+        archive.addfile(tail, io.BytesIO(bytes(tail.size)))
+        name = rows[0]['path'] if kind == 'duplicate' else ('../escape' if kind == 'traversal' else 'link')
+        bad = tarfile.TarInfo(name)
+        if kind == 'symlink':
+            bad.type, bad.linkname = tarfile.SYMTYPE, '/etc/passwd'
+            archive.addfile(bad)
+        else:
+            bad.size = len(raw)
+            archive.addfile(bad, io.BytesIO(raw))
+    out = tmp_path / 'out'
+    with pytest.raises(ValueError, match='Duplicate|links/special|Unsafe archive path'):
+        materialize(make_plan(root, manifest, out, 'speech'))
+    assert not (out / 'source.scp').exists()
+    assert not (out / 'materialization.json').exists()

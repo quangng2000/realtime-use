@@ -7,6 +7,8 @@ selected archives before extracting into local staging and publishes READY last.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+import gzip
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import shutil
 import stat
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any
 import uuid
@@ -92,8 +95,13 @@ def _receipts(backup: Path) -> list[dict[str, Any]]:
         if value['identity_sha256'] != identity:
             raise ValueError(f'Committed backup semantic identity mismatch: {path}')
         relative = _relative(archive['path'])
-        if len(relative.parts) != 2 or relative.parts[0] != 'objects' or relative.suffix != '.tar':
+        if (len(relative.parts) != 2 or relative.parts[0] != 'objects'
+                or not relative.name.endswith(('.tar', '.tar.gz'))):
             raise ValueError(f'Invalid backup archive location: {path}')
+        # A previous receipt flush may have failed after complete JSON became
+        # visible in the filesystem cache. Establish durability before reuse.
+        with path.open('rb') as handle:
+            os.fsync(handle.fileno())
         result.append(value)
     return result
 
@@ -111,6 +119,8 @@ def _verify_archive(backup: Path, receipt: dict[str, Any]) -> Path:
     _confined(backup, path)
     if not path.is_file() or path.stat().st_size != archive['bytes'] or _digest(path) != archive['sha256']:
         raise ValueError(f'Committed backup archive integrity mismatch: {path}')
+    with path.open('rb') as handle:
+        os.fsync(handle.fileno())
     return path
 
 
@@ -129,7 +139,12 @@ class _HashingWriter:
 
 class PreparationBackup:
     """Back up completed units; concurrency settings never change recipe identity."""
-    def __init__(self, output_root: Path, backup_dir: Path):
+    def __init__(self, output_root: Path, backup_dir: Path, *, compression: str = 'none'):
+        if compression not in ('none', 'gzip'):
+            raise ValueError('Backup compression must be none or gzip')
+        self.compression = compression
+        self._receipt_lock = threading.Lock()
+        self._active_units = set()
         self.output_root = output_root.expanduser().resolve(strict=True)
         self.backup_dir = backup_dir.expanduser().resolve()
         if not self.output_root.is_dir():
@@ -165,11 +180,26 @@ class PreparationBackup:
     def checkpoint(self, unit: str, paths: list[Path], identity_paths: list[Path]) -> dict[str, Any]:
         if not isinstance(unit, str) or not unit or '\x00' in unit:
             raise ValueError('Checkpoint unit must be a nonempty name')
+        with self._receipt_lock:
+            if unit in self._active_units:
+                raise RuntimeError(f'Checkpoint unit is already active: {unit}')
+            if 'final' in self._active_units or (unit == 'final' and self._active_units):
+                raise RuntimeError('Final checkpoint requires all other checkpoints to finish')
+            self._active_units.add(unit)
+        try:
+            return self._checkpoint(unit, paths, identity_paths)
+        finally:
+            with self._receipt_lock:
+                self._active_units.remove(unit)
+
+    def _checkpoint(self, unit: str, paths: list[Path], identity_paths: list[Path]) -> dict[str, Any]:
         request_hash, identities = self._identity(identity_paths, final=unit == 'final')
-        for receipt in self._receipts:
+        with self._receipt_lock:
+            receipts = tuple(self._receipts)
+        for receipt in receipts:
             if receipt['output_root'] != str(self.output_root) or receipt['request_sha256'] != request_hash:
                 raise ValueError('Backup contains checkpoints from a different output root or preparation request')
-        latest = _latest(self._receipts)
+        latest = _latest(receipts)
         dependencies = ({name: item['receipt_sha256'] for name, item in latest.items() if name != 'final'}
                         if unit == 'final' else {})
         identity = _hash_json({'unit': unit, 'identity_files': identities, 'dependencies': dependencies})
@@ -198,31 +228,38 @@ class PreparationBackup:
         if unit == 'final' and ('READY.json' not in members or not dependencies):
             raise ValueError('Final checkpoint requires READY.json and preceding unit receipts')
         token = uuid.uuid4().hex
-        archive_relative = f'objects/{token}.tar'
+        archive_relative = f'objects/{token}.tar' + ('.gz' if self.compression == 'gzip' else '')
         archive_path = self.backup_dir / archive_relative
-        # No rename, lock, or remote fsync is needed: this unique object remains
-        # uncommitted until a complete descriptor has been written and read back.
+        # A unique object needs no remote rename or lock. Flush it through the
+        # filesystem before readback: a FUSE cache hit alone proves no durability.
         with archive_path.open('xb') as destination:
             writer = _HashingWriter(destination)
-            with tarfile.open(fileobj=writer, mode='w|', format=tarfile.PAX_FORMAT, bufsize=_BLOCK) as archive:
-                for name, path in sorted(members.items()):
-                    before = path.stat()
-                    info = tarfile.TarInfo(name)
-                    info.mtime = int(before.st_mtime)
-                    info.mode = stat.S_IMODE(before.st_mode) & 0o777
-                    if path.is_dir():
-                        info.type = tarfile.DIRTYPE
-                        archive.addfile(info)
-                    else:
-                        info.size = before.st_size
-                        with path.open('rb') as source:
-                            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                                raise ValueError(f'Checkpoint member changed type: {path}')
-                            archive.addfile(info, source)
-                        after = path.stat()
-                        if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
-                            raise ValueError(f'Checkpoint member changed during backup: {path}')
+            # Hash the stored bytes, including the gzip footer. Compression is
+            # transport policy only: existing semantic receipts remain reusable.
+            compressor = (gzip.GzipFile(filename='', mode='wb', fileobj=writer,
+                                       compresslevel=1, mtime=0)
+                          if self.compression == 'gzip' else nullcontext(writer))
+            with compressor as stream:
+                with tarfile.open(fileobj=stream, mode='w|', format=tarfile.PAX_FORMAT, bufsize=_BLOCK) as archive:
+                    for name, path in sorted(members.items()):
+                        before = path.stat()
+                        info = tarfile.TarInfo(name)
+                        info.mtime = int(before.st_mtime)
+                        info.mode = stat.S_IMODE(before.st_mode) & 0o777
+                        if path.is_dir():
+                            info.type = tarfile.DIRTYPE
+                            archive.addfile(info)
+                        else:
+                            info.size = before.st_size
+                            with path.open('rb') as source:
+                                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                                    raise ValueError(f'Checkpoint member changed type: {path}')
+                                archive.addfile(info, source)
+                            after = path.stat()
+                            if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+                                raise ValueError(f'Checkpoint member changed during backup: {path}')
             destination.flush()
+            os.fsync(destination.fileno())
         descriptor = {'path': archive_relative, 'bytes': writer.bytes, 'sha256': writer.digest.hexdigest()}
         if archive_path.stat().st_size != writer.bytes or _digest(archive_path) != descriptor['sha256']:
             raise ValueError('Backup archive read-back integrity check failed')
@@ -238,16 +275,28 @@ class PreparationBackup:
         with commit.open('xb') as handle:
             handle.write(encoded)
             handle.flush()
+            os.fsync(handle.fileno())
         if commit.read_bytes() != encoded:
             raise ValueError('Backup receipt read-back check failed')
-        self._receipts.append(receipt)
+        with self._receipt_lock:
+            self._receipts.append(receipt)
         return receipt
 
 
 def _extract(archive_path: Path, staging: Path) -> set[str]:
     """Confine members explicitly; never use tarfile.extract/extractall."""
     seen = set()
-    with tarfile.open(archive_path, mode='r|', bufsize=_BLOCK) as archive:
+    with archive_path.open('rb') as source:
+        header = source.read(tarfile.BLOCKSIZE)
+    if archive_path.name.endswith('.tar.gz'):
+        if not header.startswith(b'\x1f\x8b'):
+            raise ValueError('Backup archive compression differs from its descriptor')
+    else:
+        try:
+            tarfile.TarInfo.frombuf(header, encoding='utf-8', errors='surrogateescape')
+        except tarfile.HeaderError as exc:
+            raise ValueError('Backup archive format differs from its .tar descriptor') from exc
+    with tarfile.open(archive_path, mode='r|*', bufsize=_BLOCK) as archive:
         for member in archive:
             relative = _relative(member.name)
             name = relative.as_posix()

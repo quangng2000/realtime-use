@@ -178,6 +178,17 @@ def test_readback_failure_publishes_no_commit(tmp_path, monkeypatch):
     assert len(list((sink.backup_dir / 'commits').glob('*.json'))) == 1
 
 
+def test_archive_sync_failure_publishes_no_commit(tmp_path, monkeypatch):
+    root, sink = output(tmp_path)
+    path, identities = chunk(root)
+    def failed_sync(fd):
+        raise OSError('persistent flush failed')
+    monkeypatch.setattr(backup.os, 'fsync', failed_sync)
+    with pytest.raises(OSError, match='persistent flush failed'):
+        sink.checkpoint('chunks/train/000000', [path], identities)
+    assert len(list((sink.backup_dir / 'commits').glob('*.json'))) == 1
+
+
 def test_corrupted_committed_receipt_is_rejected(tmp_path):
     root, sink = output(tmp_path)
     path = next((sink.backup_dir / 'commits').glob('*.json'))

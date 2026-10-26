@@ -3,7 +3,8 @@
 Preparation runs on local POSIX storage. Optional backups are immutable archives
 on a separate persistent destination, including an object-backed filesystem mount.
 The backup protocol does not depend on destination file locks, atomic rename,
-remote `fsync`, or a mutable “latest” pointer. It never starts training.
+or a mutable “latest” pointer. The destination must support `fsync` for durable
+archive and receipt publication. It never starts training.
 
 `PreparationBackup(output_root, backup_dir).checkpoint(unit, paths, identity_paths)`
 is called only after a preparation unit has closed all its writers and passed its
@@ -19,10 +20,10 @@ Each checkpoint:
    manifest, render journal, and generated metadata. Timings and reused/extracted
    counters are archived but do not determine whether a checkpoint is new.
 3. Streams the closed files into a new uniquely named tar under `objects/`, with
-   no complete tar staged on the local disk. It reads the persistent archive back
-   and checks its byte count and SHA-256.
+   no complete tar staged on the local disk. It flushes and syncs the archive,
+   then reads it back and checks its byte count and SHA-256.
 4. Writes a uniquely named JSON receipt under `commits/` last and checks that it
-   can be read back intact. The receipt includes its own checksum. A partial
+   is synced and can be read back intact. The receipt includes its own checksum. A partial
    archive or truncated receipt is never a completed checkpoint.
 
 An unchanged unit reuses its receipt only after verifying the saved archive
@@ -35,6 +36,21 @@ read local `READY.pending.json`, storing it under the final name `READY.json`.
 The release driver can therefore publish local readiness only after the final
 backup succeeds. If a later checkpoint advances a unit, recovery excludes the old
 final receipt and does not restore its stale readiness marker.
+
+## Throughput options
+
+`--overlap-backups` allows closed chunk checkpoints to run while the next chunk
+renders on local disk. `--backup-workers 1` (default) or `2` limits concurrent checkpoints; the queue
+is bounded and final readiness waits for every result. Materialization checkpoints remain synchronous; use `--materialize-workers 1`
+to avoid competing remote source reads. Interrupted work can require repeating an uncommitted chunk;
+completed receipts remain valid.
+
+`--backup-compression gzip` uses standard-library lossless gzip level 1 to reduce
+transfer and storage size. It changes the checkpoint container only; audio bytes
+restore exactly. Default `none` writes uncompressed tar. Both formats may coexist
+in one backup, and changing compression does not change the frozen recipe or
+force already verified checkpoints to be rewritten. Benchmark throughput on the
+actual destination before choosing these runtime options.
 
 ## Restore
 
@@ -82,6 +98,8 @@ at the original absolute output path.
 
 Previously committed units survive loss of the CPU machine when their persistent
 backup remains available. An unexpected machine loss can require repeating the
-active, not-yet-committed chunk (up to the configured 1,024 utterances) or source
-materialization group. A planned shutdown should wait until a checkpoint boundary
+active, not-yet-committed chunks or source materialization group. Without
+overlap, at most one chunk is active. With overlap, up to `backup-workers` closed
+chunks and one currently rendering chunk may need to be repeated; each has up to
+the configured 1,024 utterances. A planned shutdown should wait until a checkpoint boundary
 has completed. The original source archives remain independently preserved.

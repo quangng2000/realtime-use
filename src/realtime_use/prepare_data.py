@@ -534,6 +534,30 @@ def _worker_count(workers):
     return workers
 
 
+def _render_worker_plan(plan, metadata):
+    """Send only committed metadata's sources to each spawned renderer.
+
+    Sampling already finished against the full inventories. Workers only look
+    up those chosen IDs; the parent's saved plan and provenance stay complete.
+    """
+    inventories = plan['inventories']
+    selected = {role: {} for role in inventories}
+    def include(role, uid):
+        if uid not in inventories[role]:
+            raise ValueError(f'Committed render metadata references missing {role} ID: {uid}')
+        selected[role][uid] = dict(inventories[role][uid])
+    for row in metadata:
+        include('speech', row['speech_uid'])
+        noise_uid = row['noise_uid']
+        # Preserve the merged mapping's wind precedence. Validated plans require
+        # disjoint IDs, but direct renderer callers must keep the same lookup.
+        include('wind' if noise_uid in inventories['wind'] else 'noise', noise_uid)
+        if row['rir_uid'] != 'none':
+            include('rir', row['rir_uid'])
+    return {**{key: value for key, value in plan.items() if key != 'rir_alignment_evidence'},
+            'inventories': selected}
+
+
 def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None = None,
                     workers: int = 1, execution: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Render official metadata with bounded CPU work and an ordered parent ledger.
@@ -544,9 +568,6 @@ def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None 
     """
     workers = _worker_count(workers)
     output = Path(plan['output_dir'])
-    mappings = {role: {uid: entry['path'] for uid, entry in entries.items()}
-                for role, entries in plan['inventories'].items()}
-    mappings['noise'].update(mappings['wind'])
     completed = _load_progress(progress_path) if progress_path is not None else {}
     metadata = read_metadata(output / 'log/meta.tsv')
     if any(index >= len(metadata) for index in completed):
@@ -571,6 +592,9 @@ def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None 
         rows.append(row)
 
     if workers == 1:
+        mappings = {role: {uid: entry['path'] for uid, entry in entries.items()}
+                    for role, entries in plan['inventories'].items()}
+        mappings['noise'].update(mappings['wind'])
         hashes = {}
         for index, original in enumerate(metadata):
             commit(_render_row(plan, module, index, original, mappings, hashes,
@@ -582,7 +606,7 @@ def render_metadata(plan: dict[str, Any], module, *, progress_path: Path | None 
     # final pairs live on a remote filesystem. Each child has a separate cwd.
     # Bounded submission also bounds completed results waiting behind a slower
     # earlier row. Metadata-order commit keeps journals/manifests deterministic.
-    worker_plan = {key: value for key, value in plan.items() if key != 'rir_alignment_evidence'}
+    worker_plan = _render_worker_plan(plan, metadata)
     with _graceful_sigterm(), _spawn_cpu_environment(), tempfile.TemporaryDirectory(prefix='realtime-use-render-') as scratch:
         pool = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'),
                                    initializer=_render_worker_init, initargs=(worker_plan, scratch))

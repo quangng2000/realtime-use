@@ -67,11 +67,17 @@ be outside the active output tree, on storage that survives loss of the compute
 instance. Its location is recorded in `execution.json`, outside the frozen
 request, so it can change when resuming. The pipeline first checkpoints its
 request and partitioned indices, then each closed materialization group and each
-verified rendered chunk before proceeding. A backup failure stops preparation,
+verified rendered chunk before proceeding by default. With `--overlap-backups`,
+closed chunk checkpoints overlap the next local render. `--backup-workers 1`
+(default) or `2` bounds concurrent checkpoint I/O; the queue is drained before
+final audits and readiness. `--backup-compression gzip` optionally
+uses lossless gzip level 1 for backup containers. Both options are execution
+settings and preserve sampled audio and recipe identity. A backup failure stops preparation,
 cleans up active materialization workers, and prevents publication of `READY.json`.
 
 Checkpoints stream immutable tar archives directly to the backup destination,
-verify their full contents by checksum, and publish a receipt last. They do not
+flush them durably, verify their full contents by checksum, and publish a synced
+receipt last. They do not
 need a second local tar copy. Runtime timings and reused-file counts do not change
 checkpoint identity. The final checkpoint includes manifests, audits,
 `data-paths.yaml`, and the staged readiness marker; local readiness is published

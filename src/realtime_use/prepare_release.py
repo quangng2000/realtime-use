@@ -6,9 +6,9 @@ audio, runs the pinned URGENT adapter in resumable chunks, and audits the result
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from contextlib import contextmanager
+from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import hashlib
 import json
@@ -472,11 +472,92 @@ def _combine(manifests: list[Path], destination: Path, split: str) -> int:
     return counts[0]
 
 
+class _ChunkBackups:
+    """Bounded closed chunks in backup while the next chunk renders locally.
+
+    Source materialization stays synchronous: its remote archive reads must not
+    compete with checkpoint I/O. All backup workers join before final publication,
+    so the final receipt includes every preceding checkpoint dependency.
+    """
+    def __init__(self, backup, overlap: bool, workers: int = 1):
+        self.backup, self.overlap = backup, overlap
+        self.workers = workers
+        self.executor, self.pending = None, deque()
+
+    def __enter__(self):
+        if self.overlap:
+            self.executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix='chunk-backup')
+        return self
+
+    def drain(self):
+        failure = None
+        while self.pending:
+            try:
+                self.pending[0].result()
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+            finally:
+                self.pending.popleft()
+        if failure is not None:
+            raise failure
+
+    def check(self):
+        # A later failure must not hide behind an earlier slow checkpoint.
+        for future in self.pending:
+            if future.done():
+                future.result()
+        while self.pending and self.pending[0].done():
+            self.pending.popleft().result()
+
+    def checkpoint(self, unit, paths, identity_paths):
+        if self.executor is None:
+            self.backup.checkpoint(unit, paths, identity_paths)
+        else:
+            self.check()
+            if len(self.pending) >= self.workers:
+                self.pending[0].result()
+                self.pending.popleft()
+                self.check()
+            # No executor queue beyond the configured active checkpoint count.
+            self.pending.append(self.executor.submit(self.backup.checkpoint, unit, paths, identity_paths))
+
+    def __exit__(self, exc_type, exc, traceback):
+        try:
+            self.drain()
+        except BaseException as backup_error:
+            if exc_type is None:
+                raise
+            # Preserve a render/cancellation failure while still observing the
+            # background result. The closed chunk remains resumable on disk.
+            if hasattr(exc, 'add_note'):
+                exc.add_note(f'Chunk backup also failed during cleanup: {backup_error!r}')
+        finally:
+            if self.executor is not None:
+                self.executor.shutdown(wait=True, cancel_futures=True)
+        return False
+
+
 def execute_release(plan: dict[str, Any], *, workers: int = 1,
                     materialize_workers: int = 1,
-                    backup_dir: Path | None = None) -> dict[str, Any]:
+                    backup_dir: Path | None = None,
+                    overlap_backups: bool = False,
+                    backup_compression: str = 'none',
+                    backup_workers: int = 1) -> dict[str, Any]:
     workers = _worker_count(workers, 'workers')
     materialize_workers = _worker_count(materialize_workers, 'materialize_workers')
+    if not isinstance(overlap_backups, bool):
+        raise ValueError('overlap_backups must be a boolean')
+    if overlap_backups and backup_dir is None:
+        raise ValueError('Overlapping backups requires a backup directory')
+    if isinstance(backup_workers, bool) or not isinstance(backup_workers, int) or backup_workers not in (1, 2):
+        raise ValueError('backup_workers must be 1 or 2')
+    if backup_workers != 1 and not overlap_backups:
+        raise ValueError('Two backup workers requires overlap_backups')
+    if backup_compression not in ('none', 'gzip'):
+        raise ValueError('Backup compression must be none or gzip')
+    if backup_compression != 'none' and backup_dir is None:
+        raise ValueError('Backup compression requires a backup directory')
     output = Path(plan['output_dir'])
     if backup_dir is not None:
         backup_dir = Path(backup_dir).expanduser().resolve()
@@ -494,13 +575,15 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     backup = None
     if backup_dir is not None:
         from .preparation_backup import PreparationBackup
-        backup = PreparationBackup(output, backup_dir)
+        backup = PreparationBackup(output, backup_dir, compression=backup_compression)
     _invalidate_ready(output)
     # Concurrency is operational state, not part of the frozen data recipe.
     # Recording it separately lets a resumed job change its CPU allocation.
     _write(output / 'execution.json', _json({'render_workers': workers,
         'materialize_workers': materialize_workers, 'process_start_method': 'spawn',
-        **({'backup_dir': str(backup_dir)} if backup_dir is not None else {}),
+        **({'backup_dir': str(backup_dir), 'overlap_backups': overlap_backups,
+            'backup_compression': backup_compression, 'backup_workers': backup_workers}
+           if backup_dir is not None else {}),
         'training_started': False}), immutable=False)
     _progress(output, stage='partitioning', selection=plan['selection_scope'], selected_counts=plan['selected_counts'])
     partitions = _partition(plan)
@@ -514,39 +597,43 @@ def execute_release(plan: dict[str, Any], *, workers: int = 1,
     combined, counts, rendered = {}, {}, {}
     # Validate/render the constrained validation RIR recipe before committing
     # potentially days of work to the much larger training split.
-    for split in ('validation', 'train'):
-        base = _split_plan(plan, materialized, split)
-        speech = list(base['inventories']['speech'])
-        size, used_rirs, manifests = plan['chunk_size'], set(), []
-        for index, start in enumerate(range(0, len(speech), size)):
-            selected = speech[start:start + size]
-            _progress(output, stage='rendering', split=split, chunk=index,
-                      completed_speech=start, total_speech=len(speech))
-            chunk = _chunk_plan(base, selected, index, output, used_rirs)
-            manifest = prep.execute_preparation(chunk, resume=True, workers=workers)
-            observed = set()
-            for row in _rows(manifest):
-                observed.add(row['speech_uid'])
-                if row.get('rir_uid') != 'none':
-                    used_rirs.add(row['rir_uid'])
-            if observed != set(selected):
-                raise ValueError('Rendered chunk did not cover exactly the selected speech')
-            if backup is not None:
-                directory = Path(chunk['output_dir'])
-                inputs = output / 'chunk-inputs' / split / f'{index:06d}'
-                settings = output / 'settings' / split
-                # These files define the samples and their resume identity.
-                # provenance.json includes changing timings/reuse counts and is
-                # archived for diagnosis, but must not force a new checkpoint.
-                identity = [directory / name for name in (
-                    'plan.json', 'simulation.yaml', 'render-runtime.json',
-                    'render-progress.jsonl', 'manifest.jsonl', 'log/meta.tsv')]
-                identity.extend(path for parent in (inputs, settings)
-                                for path in sorted(parent.rglob('*')) if path.is_file())
-                backup.checkpoint(f'chunks/{split}/{index:06d}',
-                                  [directory, inputs, settings], identity)
-            manifests.append(manifest)
-        rendered[split] = manifests
+    signal_guard = prep._graceful_sigterm() if overlap_backups else nullcontext()
+    with signal_guard, _ChunkBackups(backup, overlap_backups, backup_workers) as checkpoints:
+        for split in ('validation', 'train'):
+            checkpoints.check()
+            base = _split_plan(plan, materialized, split)
+            speech = list(base['inventories']['speech'])
+            size, used_rirs, manifests = plan['chunk_size'], set(), []
+            for index, start in enumerate(range(0, len(speech), size)):
+                checkpoints.check()  # Stop before more work if backup already failed.
+                selected = speech[start:start + size]
+                _progress(output, stage='rendering', split=split, chunk=index,
+                          completed_speech=start, total_speech=len(speech))
+                chunk = _chunk_plan(base, selected, index, output, used_rirs)
+                manifest = prep.execute_preparation(chunk, resume=True, workers=workers)
+                observed = set()
+                for row in _rows(manifest):
+                    observed.add(row['speech_uid'])
+                    if row.get('rir_uid') != 'none':
+                        used_rirs.add(row['rir_uid'])
+                if observed != set(selected):
+                    raise ValueError('Rendered chunk did not cover exactly the selected speech')
+                if backup is not None:
+                    directory = Path(chunk['output_dir'])
+                    inputs = output / 'chunk-inputs' / split / f'{index:06d}'
+                    settings = output / 'settings' / split
+                    # These files define the samples and their resume identity.
+                    # provenance.json includes changing timings/reuse counts and is
+                    # archived for diagnosis, but must not force a new checkpoint.
+                    identity = [directory / name for name in (
+                        'plan.json', 'simulation.yaml', 'render-runtime.json',
+                        'render-progress.jsonl', 'manifest.jsonl', 'log/meta.tsv')]
+                    identity.extend(path for parent in (inputs, settings)
+                                    for path in sorted(parent.rglob('*')) if path.is_file())
+                    checkpoints.checkpoint(f'chunks/{split}/{index:06d}',
+                                           [directory, inputs, settings], identity)
+                manifests.append(manifest)
+            rendered[split] = manifests
     # Neither final split manifest is published until every chunk of both
     # splits completed. READY.json remains the final release commit marker.
     pending = {}
@@ -601,6 +688,12 @@ def main() -> None:
                         help='Parallel independent source-group extraction processes; runtime setting, not a recipe change')
     parser.add_argument('--backup-dir', type=Path,
                         help='Persistent checkpoints outside the local output; runtime setting, not a recipe change')
+    parser.add_argument('--overlap-backups', action='store_true',
+                        help='Back up closed chunks while the next renders locally; requires --backup-dir')
+    parser.add_argument('--backup-workers', type=int, choices=(1, 2), default=1,
+                        help='Concurrent checkpoints; 2 requires --overlap-backups')
+    parser.add_argument('--backup-compression', choices=('none', 'gzip'), default='none',
+                        help='Lossless checkpoint compression; gzip uses level1 and requires --backup-dir')
     parser.add_argument('--usage', choices=('research',), default='research',
                         help='This release route retains pending permission evidence; commercial preparation uses the audited adapter separately')
     parser.add_argument('--rir-alignment', choices=('upstream-estimated-onset',), default='upstream-estimated-onset')
@@ -613,7 +706,8 @@ def main() -> None:
     plan = release_plan(args.root, args.source, args.output_dir, chunk_size=args.chunk_size,
                         max_speech_per_split=args.max_speech_per_split, validation_reuse_rir=args.validation_reuse_rir)
     print(_json(execute_release(plan, workers=args.workers, materialize_workers=args.materialize_workers,
-                               backup_dir=args.backup_dir)
+                               backup_dir=args.backup_dir, overlap_backups=args.overlap_backups,
+                               backup_compression=args.backup_compression, backup_workers=args.backup_workers)
                 if args.execute else plan))
 
 

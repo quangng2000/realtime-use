@@ -23,6 +23,7 @@ import soundfile as sf
 
 ROLES = ('speech', 'noise', 'rir', 'wind')
 SPLITS = ('train', 'validation', 'test')
+_ARCHIVE_BUFFER_BYTES = 1024 * 1024
 
 
 def file_sha256(path: Path) -> str:
@@ -145,6 +146,7 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
         raise ValueError('The official SCP format cannot represent output paths containing whitespace')
     rows: list[dict[str, Any]] = []
     seen_ids, seen_members = set(), set()
+    resolved_shards: dict[PurePosixPath, Path] = {}
     source_split = None
     with manifest.open(encoding='utf-8') as handle:
         for line_number, line in enumerate(handle, 1):
@@ -183,9 +185,14 @@ def make_plan(root: Path, manifest: Path, output: Path, role: str,
                 raise ValueError('Each record requires its original lowercase SHA-256')
             member = str(_relative(row['path']))
             shard_relative = _relative(row['shard'])
-            shard = (root / shard_relative).resolve(strict=True)
-            if not shard.is_relative_to(root) or not shard.is_file():
-                raise ValueError('Source shard escapes the dataset root or is not a file')
+            # Thousands of records share each immutable published shard. Validate
+            # its filesystem location once per planning call, never across runs.
+            if shard_relative not in resolved_shards:
+                shard = (root / shard_relative).resolve(strict=True)
+                if not shard.is_relative_to(root) or not shard.is_file():
+                    raise ValueError('Source shard escapes the dataset root or is not a file')
+                resolved_shards[shard_relative] = shard
+            shard = resolved_shards[shard_relative]
             # Recorded-source identities exclude split to expose leakage. Some
             # synthetic wind runs restart their counters independently per split.
             # Opting into split-local IDs preserves raw IDs and waveform hashes.
@@ -269,7 +276,10 @@ def materialize(plan: dict[str, Any]) -> dict[str, Any]:
     for shard, wanted in pending.items():
         found = set()
         # Never call extract/extractall. Tar headers never control an output path.
-        with tarfile.open(shard, mode='r|*') as archive:
+        # Use fewer Python read calls than the stdlib's 10 KiB stream default;
+        # kernel/FUSE caching determines actual remote requests. Keep the buffer
+        # bounded and scan all headers, including duplicate/special-entry tails.
+        with tarfile.open(shard, mode='r|*', bufsize=_ARCHIVE_BUFFER_BYTES) as archive:
             for member in archive:
                 name = str(_relative(member.name))
                 if not (member.isfile() or member.isdir()):
